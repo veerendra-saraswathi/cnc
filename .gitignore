@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDEs
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+
+# Environment / secrets
+.env
+.env.*
+
+# Databases / runtime state
+*.db
+*.sqlite
+*.sqlite3
+*.duckdb
+*.duckdb.wal
+*.duckdb-shm
+
+# ML model weights
+*.pt
+*.pth
+*.onnx
+
+# Generated / temporary files
+*.bak
+*.tmp
+*.log
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/

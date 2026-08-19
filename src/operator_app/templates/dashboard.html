@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CNC – Mission Autonomy Platform</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="/static/css/dashboard.css" />
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div class="brand">
+        <span class="dot"></span>
+        CNC · Unified Mission Autonomy Platform
+      </div>
+      <div class="meta">
+        <span>Assets <strong id="asset-count">–</strong></span>
+        <span>Link <strong id="conn-status" style="color:var(--muted)">Connecting…</strong></span>
+        <span id="clock">–</span>
+      </div>
+    </header>
+
+    <aside class="sidebar">
+      <h2>Assets</h2>
+      <div class="asset-list" id="asset-list">
+        <div style="color:var(--muted);font-size:12px;padding:12px;">Waiting for telemetry…</div>
+      </div>
+    </aside>
+
+    <main class="map-panel">
+      <div id="map"></div>
+      <div class="map-overlay">Click map while GOTO is open to set target</div>
+    </main>
+
+    <aside class="rightbar">
+      <h2>Command</h2>
+      <div class="selected-info" id="selected-info">Select an asset</div>
+
+      <div class="cmd-grid">
+        <button class="cmd-btn" id="btn-takeoff" data-uav-only="1" disabled>TAKEOFF</button>
+        <button class="cmd-btn" id="btn-land" data-uav-only="1" disabled>LAND</button>
+        <button class="cmd-btn primary" id="btn-goto" disabled>GOTO</button>
+        <button class="cmd-btn" id="btn-hold" disabled>HOLD</button>
+        <button class="cmd-btn danger" id="btn-rtl" disabled>RTL</button>
+      </div>
+
+      <div class="goto-form" id="goto-form">
+        <label>Latitude</label>
+        <input type="number" id="goto-lat" step="0.000001" />
+        <label>Longitude</label>
+        <input type="number" id="goto-lon" step="0.000001" />
+        <div class="row">
+          <div>
+            <label>Altitude (m)</label>
+            <input type="number" id="goto-alt" step="1" value="50" />
+          </div>
+        </div>
+        <div class="cmd-grid" style="padding:0;margin-top:4px;">
+          <button class="cmd-btn primary" id="btn-goto-exec">Execute GOTO</button>
+          <button class="cmd-btn" id="btn-goto-cancel">Cancel</button>
+        </div>
+      </div>
+
+      <div class="alerts-section">
+        <h2>Alerts</h2>
+        <div class="alerts-list" id="alerts-list">
+          <div style="color:var(--muted);font-size:12px;padding:8px;">No active alerts</div>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="/static/js/dashboard.js"></script>
+</body>
+</html>
