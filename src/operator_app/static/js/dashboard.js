@@ -7,6 +7,7 @@ let assetMarkers = {};
 let trackMarkers = {};
 let ws = null;
 let gotoMode = false;
+let mapFitted = false;
 
 function initMap() {
   map = L.map("map", { zoomControl: true }).setView([17.4505, 78.4810], 15);
@@ -175,6 +176,11 @@ function connectWS() {
       upsertAssetMarker(a);
     });
     assets = nextAssets;
+    if (!mapFitted && map && Object.keys(assets).length > 0) {
+      const pts = Object.values(assets).map((a) => [a.lat, a.lon]);
+      map.fitBounds(pts, { padding: [40, 40], maxZoom: 15 });
+      mapFitted = true;
+    }
     renderAssets();
     if (selectedId && !assets[selectedId]) selectAsset(null);
     else if (selectedId) selectAsset(selectedId);

@@ -662,9 +662,10 @@ class Platform:
         if not ad:
             cmd.status = "failed"
             cmd.result = {"error": "asset not found"}
-            return cmd
-        ok = await ad.send_command(cmd)
-        cmd.status = "sent" if ok else "failed"
+        else:
+            ok = await ad.send_command(cmd)
+            cmd.status = "sent" if ok else "failed"
+        _record_command_event(cmd)
         return cmd
 
     async def start(self):
@@ -715,14 +716,32 @@ class Platform:
 # ── FastAPI ────────────────────────────────────────────────────────────
 platform = Platform()
 
+def _record_command_event(cmd: Command) -> None:
+    """Every issued command carries operator id, time, and asset id."""
+    try:
+        from src.data_services.event_store import EventType, event_store
+        event_store.add(
+            EventType.COMMAND,
+            f"{cmd.command_type.value} ({cmd.status})",
+            asset_id=cmd.asset_id,
+            data={
+                "operator_id": cmd.issued_by,
+                "command_id": cmd.id,
+                "command_type": cmd.command_type.value,
+                "status": cmd.status,
+            },
+        )
+    except Exception as exc:
+        print(f"[Event] command record failed: {exc}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await platform.start()
-    # Always ensure the four demo assets exist
-    await platform.register(MockAsset("Eagle-1", AssetType.UAV, 17.4500, 78.4800))
-    await platform.register(MockAsset("Eagle-2", AssetType.UAV, 17.4515, 78.4815))
-    await platform.register(MockAsset("Wolf-1", AssetType.UGV, 17.4490, 78.4790))
-    await platform.register(MockAsset("Wolf-2", AssetType.UGV, 17.4485, 78.4820))
+    from simulations.simple_assets import create_demo_fleet
+    from src.operator_app.adapters.sim_asset_adapter import SimAssetAdapter
+    for sim in create_demo_fleet().values():
+        await platform.register(SimAssetAdapter(sim))
     yield
     await platform.stop()
 
