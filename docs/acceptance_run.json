@@ -1,0 +1,78 @@
+{
+  "assets": [
+    "UAV-01",
+    "UAV-02",
+    "UGV-01",
+    "UGV-02"
+  ],
+  "assigned": [
+    "T001",
+    "T002",
+    "T003",
+    "T004"
+  ],
+  "commands": [
+    {
+      "asset_id": "UAV-02",
+      "verb": "goto",
+      "issued_by": "supervisor:coordinator"
+    },
+    {
+      "asset_id": "UAV-01",
+      "verb": "goto",
+      "issued_by": "supervisor:coordinator"
+    },
+    {
+      "asset_id": "UGV-01",
+      "verb": "goto",
+      "issued_by": "supervisor:coordinator"
+    },
+    {
+      "asset_id": "UGV-02",
+      "verb": "goto",
+      "issued_by": "supervisor:coordinator"
+    }
+  ],
+  "audit": [
+    {
+      "at": "2026-10-09T19:41:58.836271Z",
+      "session_id": "cb50ae23-3870-4057-b6dd-a0b6fc1c989e",
+      "issuer": "op-1",
+      "role": "operator",
+      "asset_id": "UAV-02",
+      "verb": "goto",
+      "accepted": true,
+      "reason": ""
+    },
+    {
+      "at": "2026-10-09T19:41:58.836418Z",
+      "session_id": "cb50ae23-3870-4057-b6dd-a0b6fc1c989e",
+      "issuer": "op-1",
+      "role": "operator",
+      "asset_id": "UAV-01",
+      "verb": "goto",
+      "accepted": true,
+      "reason": ""
+    },
+    {
+      "at": "2026-10-09T19:41:58.836426Z",
+      "session_id": "cb50ae23-3870-4057-b6dd-a0b6fc1c989e",
+      "issuer": "op-1",
+      "role": "operator",
+      "asset_id": "UGV-01",
+      "verb": "goto",
+      "accepted": true,
+      "reason": ""
+    },
+    {
+      "at": "2026-10-09T19:41:58.836430Z",
+      "session_id": "cb50ae23-3870-4057-b6dd-a0b6fc1c989e",
+      "issuer": "op-1",
+      "role": "operator",
+      "asset_id": "UGV-02",
+      "verb": "goto",
+      "accepted": true,
+      "reason": ""
+    }
+  ]
+}
