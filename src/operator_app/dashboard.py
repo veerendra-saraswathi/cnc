@@ -20,9 +20,10 @@ sys.path.append(str(Path(__file__).parent.parent.parent))
 from simulations.simple_assets import create_demo_fleet
 from src.communication.mqtt_client import MQTTClient
 from src.data_services.event_store import event_store, EventType
-from src.data_services.db import db
+from src.data_services.repositories import get_repositories
 from src.asset_integration.models import AssetStatus
 from src.command_control.mission_manager import mission_manager, MissionStatus
+from src.data.ingest import ingest_telemetry
 
 st.set_page_config(
     page_title="Unified Mission Autonomy Platform | RCI-DRDO",
@@ -67,6 +68,13 @@ if "mqtt" not in st.session_state:
                 if len(parts) >= 2:
                     asset_id = parts[1]
                     st.session_state.mqtt_telemetry[asset_id] = payload
+                    # dual-path ingest (Redis + Parquet)
+                    ingest_telemetry(
+                        platform_id=asset_id,
+                        state=payload,
+                        role="system",
+                        pedigree="cnc-phase1",
+                    )
             except Exception:
                 pass
 
@@ -97,7 +105,6 @@ if using_mqtt:
     # Live data from Coordinator
     for asset_id, payload in mqtt_telem.items():
         # Map Coordinator IDs (UAV-01) to existing fleet keys if needed
-        # For now we try direct match and also common variants
         candidates = [asset_id, asset_id.lower(), asset_id.replace("-", "").lower()]
         matched = None
         for key in fleet.keys():
@@ -125,7 +132,7 @@ else:
             asset.update(dt=2.0)
         t = asset.get_telemetry()
         try:
-            db.insert_telemetry(
+            get_repositories().telemetry.insert(
                 asset_id=t.asset_id,
                 timestamp=t.timestamp,
                 lat=t.position.lat,
@@ -136,6 +143,21 @@ else:
                 battery=t.battery_percent,
                 status=t.status.value if hasattr(t.status, "value") else str(t.status),
                 mode=getattr(t, "mode", "unknown")
+            )
+            # also ingest into the new dual-path store
+            ingest_telemetry(
+                platform_id=t.asset_id,
+                state={
+                    "lat": t.position.lat,
+                    "lon": t.position.lon,
+                    "alt": t.position.alt,
+                    "speed": t.speed,
+                    "battery": t.battery_percent,
+                    "status": t.status.value if hasattr(t.status, "value") else str(t.status),
+                    "mode": getattr(t, "mode", "unknown"),
+                },
+                role="system",
+                pedigree="cnc-phase1",
             )
         except Exception:
             pass

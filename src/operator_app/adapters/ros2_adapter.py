@@ -36,8 +36,13 @@ class ROS2Adapter(AssetAdapter):
 
     async def send_command(self, command: Command) -> bool:
         # TODO: publish to the appropriate ROS 2 topics / actions
-        print(f"[ROS2Adapter] {self.asset.name} received {command.command_type}")
-        return False
+        from src.operator_app.adapters.idempotency import deliver_once
+
+        async def apply(cmd: Command) -> tuple[bool, str]:
+            print(f"[ROS2Adapter] {self.asset.name} received {cmd.command_type}")
+            return False, "not implemented"
+
+        return await deliver_once(apply, command)
 
     async def get_telemetry(self) -> Optional[Telemetry]:
         # TODO: read latest messages from subscriptions

@@ -19,8 +19,11 @@ env/
 # Environment / secrets
 .env
 .env.*
+!.env.example
 
 # Databases / runtime state
+data/after_action/
+data/lake/
 *.db
 *.sqlite
 *.sqlite3

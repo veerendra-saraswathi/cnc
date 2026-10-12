@@ -7,17 +7,17 @@ Keep this list under 12 types until month 6.
 
 | Object | Meaning | Already in repo |
 |---|---|---|
-| **Asset** | UAV, UGV, USV, sensor. Hardware-agnostic. | `AssetInfo`, `AssetState` |
-| **Position** | lat, lon, alt, heading | `Position` |
-| **Telemetry** | last known live state of an Asset | `Telemetry` |
-| **Command** | operator or C2 intent to one Asset | `Command` |
-| **Mission** | ordered tasking across one or more Assets | `mission_manager.py`, `app.py` |
-| **Track** | fused estimate of a thing in the world (friendly asset or detection) | `ai_fusion/tracking.py`, `app.py` |
-| **Detection** | raw observation from one sensor / asset | perception + events |
-| **Alert** | something an operator must see | EventType.ALERT |
-| **Event** | immutable fact: command, status, detection | `event_store.py` |
-| **Zone** | keep-in / keep-out / AOI polygon | not yet — add when missions need it |
-| **OperatorAction** | who clicked what | Command.issued_by + Event |
+| **Asset** | UAV, UGV, USV, sensor. Hardware-agnostic. | `src.kernel.models.Asset` (`AssetInfo` is an alias) |
+| **Position** | lat, lon, alt, heading | `src.kernel.models.Position` |
+| **Telemetry** | last known live state of an Asset | `src.kernel.models.Telemetry` |
+| **Command** | operator or C2 intent to one Asset | `src.kernel.models.Command` |
+| **Mission** | ordered tasking across one or more Assets | `src.kernel.models.Mission` |
+| **Track** | fused estimate of a thing in the world (friendly asset or detection) | `src.kernel.models.Track` |
+| **Detection** | raw observation from one sensor / asset | `src.kernel.models.Detection` (`DetectionResult` is an alias) |
+| **Alert** | something an operator must see | `src.kernel.models.Alert` |
+| **Event** | immutable fact: command, status, detection | `src.kernel.models.Event` |
+| **Zone** | keep-in / keep-out / AOI polygon | `src.kernel.models.Zone` (keep-out blocks GOTO; a breach raises an Alert) |
+| **OperatorAction** | who clicked what | `src.kernel.models.OperatorAction` |
 
 ## Links that matter
 

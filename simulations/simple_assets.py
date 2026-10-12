@@ -4,7 +4,7 @@ Lightweight simulated assets with position trail support.
 
 import time
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List
 from src.asset_integration.models import (
     AssetType, AssetStatus, Position, Telemetry, AssetInfo
@@ -70,7 +70,7 @@ class SimulatedAsset:
     def get_telemetry(self) -> Telemetry:
         return Telemetry(
             asset_id=self.info.asset_id,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             position=self.position,
             speed=self.speed,
             battery_percent=round(self.battery, 1),

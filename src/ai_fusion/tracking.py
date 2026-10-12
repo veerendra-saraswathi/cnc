@@ -5,65 +5,11 @@ More stable Track IDs across detection cycles.
 Association uses both distance and label matching.
 """
 
-from datetime import datetime
-from typing import List, Dict, Optional, Any
-from pydantic import BaseModel, Field
-from enum import Enum
-import uuid
+from typing import List, Dict, Optional
 import math
 
-from src.ai_fusion.perception import DetectionResult, DetectionLabel
-
-
-class TrackStatus(str, Enum):
-    TENTATIVE = "tentative"
-    CONFIRMED = "confirmed"
-    COASTING = "coasting"
-    LOST = "lost"
-
-
-class Track(BaseModel):
-    track_id: str = Field(default_factory=lambda: f"T-{str(uuid.uuid4())[:4].upper()}")
-    label: DetectionLabel = DetectionLabel.OBJECT_OF_INTEREST
-    status: TrackStatus = TrackStatus.TENTATIVE
-
-    lat: float
-    lon: float
-    confidence: float = 0.0
-
-    positions: List[Dict[str, Any]] = Field(default_factory=list)
-    hits: int = 1
-    misses: int = 0
-
-    first_seen: datetime = Field(default_factory=datetime.utcnow)
-    last_seen: datetime = Field(default_factory=datetime.utcnow)
-
-    source_asset: Optional[str] = None
-    mission_id: Optional[str] = None
-    raw: Dict[str, Any] = Field(default_factory=dict)
-
-    def update(self, detection: DetectionResult):
-        self.lat = detection.lat
-        self.lon = detection.lon
-        self.confidence = max(self.confidence * 0.6 + detection.confidence * 0.4, detection.confidence)
-        self.label = detection.label
-        self.last_seen = detection.timestamp
-        self.hits += 1
-        self.misses = 0
-
-        if self.hits >= 2:
-            self.status = TrackStatus.CONFIRMED
-        else:
-            self.status = TrackStatus.TENTATIVE
-
-        self.positions.append({
-            "lat": detection.lat,
-            "lon": detection.lon,
-            "timestamp": detection.timestamp.isoformat(),
-            "confidence": detection.confidence
-        })
-        if len(self.positions) > 60:
-            self.positions = self.positions[-60:]
+from src.ai_fusion.perception import DetectionResult
+from src.kernel.models import Track, TrackStatus
 
 
 class SimpleTracker:
@@ -128,6 +74,7 @@ class SimpleTracker:
                     lon=det.lon,
                     confidence=det.confidence,
                     source_asset=det.asset_id,
+                    source_asset_ids=[det.asset_id] if det.asset_id else [],
                     mission_id=det.mission_id,
                     positions=[{
                         "lat": det.lat,

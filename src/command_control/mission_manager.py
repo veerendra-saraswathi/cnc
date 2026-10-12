@@ -2,36 +2,13 @@
 Mission Manager – uses real AI Perception (YOLO)
 """
 
-from datetime import datetime
-from enum import Enum
-from typing import Dict, Optional, List
-from pydantic import BaseModel, Field
-import uuid
+from datetime import datetime, timezone
+from typing import Optional
 
 from src.data_services.event_store import event_store, EventType
-from src.data_services.db import db
-from src.ai_fusion.perception import perception_service
-
-
-class MissionStatus(str, Enum):
-    IDLE = "idle"
-    PLANNING = "planning"
-    EXECUTING = "executing"
-    DETECTION = "detection"
-    INVESTIGATING = "investigating"
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-
-class Mission(BaseModel):
-    mission_id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8])
-    name: str = "Reconnaissance"
-    status: MissionStatus = MissionStatus.IDLE
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    detection_point: Optional[Dict] = None
-    assigned_uavs: List[str] = []
-    assigned_ugv: Optional[str] = None
-    notes: List[str] = []
+from src.data_services.repositories import get_repositories
+from src.kernel.models import Mission, MissionStatus
+perception_service = None  # temporary – not needed for data-path test
 
 
 class MissionManager:
@@ -52,7 +29,7 @@ class MissionManager:
         if "uav-02" in fleet:
             fleet["uav-02"].send_command("goto", {"lat": 17.4050, "lon": 78.4750, "alt": 120})
 
-        db.upsert_mission(
+        get_repositories().missions.upsert(
             mission_id=mission.mission_id,
             name=mission.name,
             status=mission.status.value,
@@ -97,7 +74,7 @@ class MissionManager:
                     mission.detection_point = {"lat": det.lat, "lon": det.lon}
                     mission.status = MissionStatus.DETECTION
 
-                    db.upsert_mission(
+                    get_repositories().missions.upsert(
                         mission_id=mission.mission_id,
                         name=mission.name,
                         status=mission.status.value,
@@ -123,7 +100,7 @@ class MissionManager:
                 })
                 mission.status = MissionStatus.INVESTIGATING
 
-                db.upsert_mission(
+                get_repositories().missions.upsert(
                     mission_id=mission.mission_id,
                     name=mission.name,
                     status=mission.status.value,
@@ -150,9 +127,9 @@ class MissionManager:
                 dlon = abs(ugv.position.lon - mission.detection_point["lon"])
                 if dlat < 0.002 and dlon < 0.002:
                     mission.status = MissionStatus.COMPLETED
-                    completed_at = datetime.utcnow()
+                    completed_at = datetime.now(timezone.utc)
 
-                    db.upsert_mission(
+                    get_repositories().missions.upsert(
                         mission_id=mission.mission_id,
                         name=mission.name,
                         status=mission.status.value,

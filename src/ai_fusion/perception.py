@@ -5,36 +5,13 @@ YOLO detector is active.
 Detections are automatically fed into the SimpleTracker.
 """
 
-from datetime import datetime
-from typing import List, Optional, Dict, Any
-from pydantic import BaseModel, Field
-from enum import Enum
-import uuid
+from typing import List, Optional
 from pathlib import Path
 
-from src.data_services.db import db
 from src.data_services.event_store import event_store, EventType
+from src.kernel.models import Detection, DetectionLabel
 
-
-class DetectionLabel(str, Enum):
-    VEHICLE = "vehicle"
-    PERSON = "person"
-    UNKNOWN = "unknown"
-    OBJECT_OF_INTEREST = "object_of_interest"
-
-
-class DetectionResult(BaseModel):
-    detection_id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8])
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
-    asset_id: str
-    lat: float
-    lon: float
-    label: DetectionLabel = DetectionLabel.OBJECT_OF_INTEREST
-    confidence: float = 0.0
-    bbox: Optional[List[float]] = None
-    image_path: Optional[str] = None
-    mission_id: Optional[str] = None
-    raw: Dict[str, Any] = Field(default_factory=dict)
+DetectionResult = Detection
 
 
 class BaseDetector:
@@ -141,14 +118,25 @@ class PerceptionService:
         if results:
             try:
                 from src.ai_fusion.tracking import tracker
+                from src.data.ingest import ingest_track
                 tracks = tracker.update(results)
                 for t in tracks:
+                    try:
+                        body = t.model_dump(mode="json")
+                        # Association status stays off operator dumps. Fusion
+                        # still records it; durable prefers this key over state.
+                        body["status"] = t.status.value
+                        if t.source_asset:
+                            body["source_asset"] = t.source_asset
+                        ingest_track(body, actor="fusion")
+                    except Exception as e:
+                        print(f"[Tracking] ingest failed: {e}")
                     if t.hits == 1:  # newly created track
                         event_store.add(
                             EventType.INFO,
-                            f"New Track {t.track_id} created ({t.label.value})",
+                            f"New Track {t.track_id} created ({t.label})",
                             asset_id=asset_id,
-                            data={"track_id": t.track_id, "label": t.label.value}
+                            data={"track_id": t.track_id, "label": t.label}
                         )
             except Exception as e:
                 print(f"[Tracking] update failed: {e}")
@@ -156,18 +144,10 @@ class PerceptionService:
         # Persist detections + emit events
         for det in results:
             try:
-                db.insert_detection(
-                    detection_id=det.detection_id,
-                    timestamp=det.timestamp,
-                    asset_id=det.asset_id,
-                    lat=det.lat,
-                    lon=det.lon,
-                    label=det.label.value,
-                    confidence=det.confidence,
-                    mission_id=det.mission_id
-                )
+                from src.data.ingest import ingest_detection
+                ingest_detection(det.model_dump(mode="json"), actor="fusion")
             except Exception as e:
-                print(f"[Perception] DB write failed: {e}")
+                print(f"[Perception] ingest failed: {e}")
 
             event_store.add(
                 EventType.DETECTION,

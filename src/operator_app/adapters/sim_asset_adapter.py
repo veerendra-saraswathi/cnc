@@ -6,6 +6,7 @@ import time
 
 from simulations.simple_assets import SimulatedAsset
 from src.asset_integration.models import AssetStatus as SimStatus
+from src.operator_app.adapters.telemetry_publish import accept_vendor_telemetry
 from src.operator_app.app import (
     Asset,
     AssetStatus,
@@ -87,7 +88,14 @@ class SimAssetAdapter:
         self.asset.speed = self.sim.speed
         self.asset.battery = self.sim.battery
 
+    async def publish_vendor_telemetry(self, raw):
+        return await accept_vendor_telemetry(raw)
+
     async def send_command(self, cmd: Command) -> bool:
+        from src.operator_app.adapters.idempotency import deliver_once
+        return await deliver_once(self._apply_command, cmd)
+
+    async def _apply_command(self, cmd: Command) -> bool:
         kind = cmd.command_type
         params = cmd.parameters or {}
         if kind == CommandType.GOTO:
@@ -135,7 +143,8 @@ class SimAssetAdapter:
             return True
         return False
 
-    async def get_telemetry(self) -> Telemetry | None:
+    def poll_telemetry(self) -> Telemetry | None:
+        """Sample and stamp. Does not publish, so the caller can push a frame first."""
         if not self._running:
             return None
         now = time.monotonic()
@@ -165,3 +174,9 @@ class SimAssetAdapter:
             battery=sample.battery_percent,
             status=status,
         )
+
+    async def get_telemetry(self) -> Telemetry | None:
+        sample = self.poll_telemetry()
+        if sample is None:
+            return None
+        return await self.publish_vendor_telemetry(sample)

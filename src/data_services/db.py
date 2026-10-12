@@ -3,14 +3,67 @@ CNC Data & Services Layer – Persistent store using DuckDB
 Stores: Assets, Telemetry, Commands, Missions, Events, Detections, Alerts
 """
 
+import os
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 import json
 import duckdb
 from loguru import logger
 
-DB_PATH = Path("data/cnc.duckdb")
+# CNC_DUCKDB_PATH isolates a second process from the demo server's file lock.
+# Unset, the path stays data/cnc.duckdb relative to the working directory.
+DB_PATH = Path(os.environ.get("CNC_DUCKDB_PATH") or "data/cnc.duckdb")
+
+
+def _json_object(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode()
+    if isinstance(value, str):
+        try:
+            loaded = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(loaded, dict):
+            return loaded
+    return None
+
+
+def _aware(value):
+    from src.data_services.outbox_record import aware_utc
+    return aware_utc(value)
+
+
+def _command_row(row) -> dict:
+    return {
+        "id": row[0],
+        "asset_id": row[1],
+        "command_type": row[2],
+        "parameters": _json_object(row[3]) or {},
+        "issued_by": row[4] or "operator",
+        "issued_at": _aware(row[5]),
+        "status": row[6] or "pending",
+        "result": _json_object(row[7]),
+    }
+
+
+def _event_row(row) -> dict:
+    data = _json_object(row[6]) or {}
+    actor = str(data.get("operator_id") or data.get("actor") or "system")
+    return {
+        "event_id": row[0],
+        "timestamp": _aware(row[1]),
+        "event_type": row[2],
+        "asset_id": row[3] or "",
+        "message": row[4],
+        "severity": row[5] or "info",
+        "data": data,
+        "actor": actor,
+    }
 
 
 class CNCDatabase:
@@ -62,6 +115,10 @@ class CNCDatabase:
                 issued_at       TIMESTAMP
             );
         """)
+        self.con.execute(
+            "ALTER TABLE commands ADD COLUMN IF NOT EXISTS status VARCHAR DEFAULT 'pending'"
+        )
+        self.con.execute("ALTER TABLE commands ADD COLUMN IF NOT EXISTS result VARCHAR")
 
         self.con.execute("""
             CREATE TABLE IF NOT EXISTS missions (
@@ -102,6 +159,43 @@ class CNCDatabase:
             );
         """)
 
+        self.con.execute("""
+            CREATE TABLE IF NOT EXISTS tracks (
+                track_id        VARCHAR PRIMARY KEY,
+                updated_at      TIMESTAMP,
+                asset_id        VARCHAR,
+                lat             DOUBLE,
+                lon             DOUBLE,
+                label           VARCHAR,
+                status          VARCHAR,
+                confidence      DOUBLE,
+                payload         VARCHAR
+            );
+        """)
+
+        self.con.execute("""
+            CREATE TABLE IF NOT EXISTS alerts (
+                alert_id        VARCHAR PRIMARY KEY,
+                timestamp       TIMESTAMP,
+                asset_id        VARCHAR,
+                level           VARCHAR,
+                message         VARCHAR,
+                payload         VARCHAR
+            );
+        """)
+
+        # JSON text is DuckDB's payload column. Postgres stores the same document as jsonb.
+        self.con.execute("""
+            CREATE TABLE IF NOT EXISTS outbox (
+                id              VARCHAR PRIMARY KEY,
+                subject         VARCHAR NOT NULL,
+                payload         VARCHAR NOT NULL,
+                created_at      TIMESTAMP NOT NULL,
+                published_at    TIMESTAMP,
+                attempts        INTEGER NOT NULL DEFAULT 0
+            );
+        """)
+
     # ------------------------------------------------------------------
     # Assets
     # ------------------------------------------------------------------
@@ -115,7 +209,7 @@ class CNCDatabase:
             asset_id, name, asset_type,
             json.dumps(capabilities or []),
             max_speed,
-            datetime.utcnow()
+            datetime.now(timezone.utc)
         ])
 
     # ------------------------------------------------------------------
@@ -134,7 +228,8 @@ class CNCDatabase:
     # Commands
     # ------------------------------------------------------------------
     def insert_command(self, command_id: str, asset_id: str, command_type: str,
-                       parameters: dict, issued_by: str = "operator"):
+                       parameters: dict, issued_by: str = "operator",
+                       issued_at: datetime = None):
         self.con.execute("""
             INSERT OR IGNORE INTO commands
             (command_id, asset_id, command_type, parameters, issued_by, issued_at)
@@ -142,7 +237,7 @@ class CNCDatabase:
         """, [
             command_id, asset_id, command_type,
             json.dumps(parameters or {}),
-            issued_by, datetime.utcnow()
+            issued_by, issued_at or datetime.now(timezone.utc)
         ])
 
     # ------------------------------------------------------------------
@@ -162,7 +257,7 @@ class CNCDatabase:
             detection_lat, detection_lon,
             json.dumps(assigned_uavs or []),
             assigned_ugv,
-            datetime.utcnow(),
+            datetime.now(timezone.utc),
             completed_at
         ])
 
@@ -193,6 +288,32 @@ class CNCDatabase:
             (detection_id, timestamp, asset_id, lat, lon, label, confidence, mission_id)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, [detection_id, timestamp, asset_id, lat, lon, label, confidence, mission_id])
+
+    # ------------------------------------------------------------------
+    # Tracks and alerts
+    # ------------------------------------------------------------------
+    def upsert_track(self, track_id: str, updated_at: datetime, asset_id: str = None,
+                     lat: float = None, lon: float = None, label: str = "unknown",
+                     status: str = "", confidence: float = None, payload: dict = None):
+        self.con.execute("""
+            INSERT OR REPLACE INTO tracks
+            (track_id, updated_at, asset_id, lat, lon, label, status, confidence, payload)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, [
+            track_id, updated_at, asset_id, lat, lon, label, status, confidence,
+            json.dumps(payload or {}, default=str),
+        ])
+
+    def insert_alert(self, alert_id: str, timestamp: datetime, asset_id: str = None,
+                     level: str = "info", message: str = "", payload: dict = None):
+        self.con.execute("""
+            INSERT OR REPLACE INTO alerts
+            (alert_id, timestamp, asset_id, level, message, payload)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, [
+            alert_id, timestamp, asset_id, level, message,
+            json.dumps(payload or {}, default=str),
+        ])
 
     # ------------------------------------------------------------------
     # Query helpers
@@ -227,6 +348,147 @@ class CNCDatabase:
             "assigned_ugv": row[6],
             "created_at": row[7], "completed_at": row[8]
         }
+
+    def commit_issued(self, row: dict) -> None:
+        """Command, event, and outbox. A failure rolls all three back."""
+        payload = json.dumps(row["payload"], default=str)
+        parameters = json.dumps(row["parameters"] or {})
+        data = json.dumps(row["data"] or {})
+        self.con.begin()
+        try:
+            self.con.execute(
+                """
+                INSERT INTO commands
+                (command_id, asset_id, command_type, parameters, issued_by, issued_at, status, result)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    row["command_id"], row["asset_id"], row["command_type"],
+                    parameters, row["issued_by"], row["issued_at"],
+                    row.get("status") or "pending",
+                    json.dumps(row["result"]) if row.get("result") is not None else None,
+                ],
+            )
+            self.con.execute(
+                """
+                INSERT INTO events
+                (event_id, timestamp, event_type, asset_id, message, severity, data)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    row["event_id"], row["event_time"], row["event_type"],
+                    row["event_asset_id"], row["message"], row["severity"], data,
+                ],
+            )
+            self.con.execute(
+                """
+                INSERT INTO outbox
+                (id, subject, payload, created_at, published_at, attempts)
+                VALUES (?, ?, ?, ?, NULL, 0)
+                """,
+                [row["outbox_id"], row["subject"], payload, row["created_at"]],
+            )
+            self.con.commit()
+        except Exception:
+            self.con.rollback()
+            raise
+
+    def list_unpublished(self) -> list[tuple]:
+        return self.con.execute(
+            """
+            SELECT id, subject, payload, created_at, published_at, attempts
+            FROM outbox
+            WHERE published_at IS NULL
+            ORDER BY created_at, id
+            """
+        ).fetchall()
+
+    def mark_published(self, outbox_id: str, when: datetime) -> None:
+        self.con.execute(
+            """
+            UPDATE outbox SET published_at = ?
+            WHERE id = ? AND published_at IS NULL
+            """,
+            [when, outbox_id],
+        )
+
+    def note_attempt(self, outbox_id: str) -> None:
+        self.con.execute(
+            """
+            UPDATE outbox SET attempts = attempts + 1
+            WHERE id = ? AND published_at IS NULL
+            """,
+            [outbox_id],
+        )
+
+    def mark_published_command(self, command_id: str, when: datetime) -> None:
+        self.con.execute(
+            """
+            UPDATE outbox SET published_at = ?
+            WHERE published_at IS NULL
+              AND json_extract_string(payload, '$.id') = ?
+            """,
+            [when, command_id],
+        )
+
+    def command_published(self, command_id: str) -> bool:
+        row = self.con.execute(
+            """
+            SELECT published_at FROM outbox
+            WHERE json_extract_string(payload, '$.id') = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            [command_id],
+        ).fetchone()
+        return row is not None and row[0] is not None
+
+    def update_command_result(self, command_id: str, status: str, result) -> None:
+        self.con.execute(
+            """
+            UPDATE commands SET status = ?, result = ?
+            WHERE command_id = ?
+            """,
+            [status, json.dumps(result) if result is not None else None, command_id],
+        )
+
+    def command_event_recorded(self, command_id: str) -> bool:
+        row = self.con.execute(
+            """
+            SELECT 1 FROM events
+            WHERE json_extract_string(data, '$.command_id') = ?
+            LIMIT 1
+            """,
+            [command_id],
+        ).fetchone()
+        return row is not None
+
+    def list_recent_commands(self, limit: int = 15) -> list[dict]:
+        limit = max(1, min(int(limit), 50))
+        rows = self.con.execute(
+            """
+            SELECT command_id, asset_id, command_type, parameters, issued_by,
+                   issued_at, status, result
+            FROM commands
+            ORDER BY issued_at DESC
+            LIMIT ?
+            """,
+            [limit],
+        ).fetchall()
+        return [_command_row(row) for row in rows]
+
+    def list_recent_events(self, limit: int = 500) -> list[dict]:
+        limit = max(1, min(int(limit), 500))
+        rows = self.con.execute(
+            """
+            SELECT event_id, timestamp, event_type, asset_id, message, severity, data
+            FROM events
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            [limit],
+        ).fetchall()
+        return [_event_row(row) for row in rows]
 
     def close(self):
         self.con.close()

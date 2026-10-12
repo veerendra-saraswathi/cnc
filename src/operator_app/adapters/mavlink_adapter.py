@@ -44,8 +44,13 @@ class MAVLinkAdapter(AssetAdapter):
     async def send_command(self, command: Command) -> bool:
         # TODO: translate Command → MAVLink message
         # (MISSION_ITEM, SET_MODE, COMMAND_LONG, etc.)
-        print(f"[MAVLinkAdapter] {self.asset.name} received {command.command_type}")
-        return False   # not implemented yet
+        from src.operator_app.adapters.idempotency import deliver_once
+
+        async def apply(cmd: Command) -> tuple[bool, str]:
+            print(f"[MAVLinkAdapter] {self.asset.name} received {cmd.command_type}")
+            return False, "not implemented"
+
+        return await deliver_once(apply, command)
 
     async def get_telemetry(self) -> Optional[Telemetry]:
         # TODO: read GLOBAL_POSITION_INT, HEARTBEAT, SYS_STATUS, etc.

@@ -43,6 +43,7 @@
         <button class="cmd-btn primary" id="btn-goto" disabled>GOTO</button>
         <button class="cmd-btn" id="btn-hold" disabled>HOLD</button>
         <button class="cmd-btn danger" id="btn-rtl" disabled>RTL</button>
+        <button class="cmd-btn" id="btn-detect" data-uav-only="1" disabled>DETECT</button>
       </div>
 
       <div class="goto-form" id="goto-form">
@@ -59,6 +60,27 @@
         <div class="cmd-grid" style="padding:0;margin-top:4px;">
           <button class="cmd-btn primary" id="btn-goto-exec">Execute GOTO</button>
           <button class="cmd-btn" id="btn-goto-cancel">Cancel</button>
+        </div>
+      </div>
+
+      <div class="cop-section">
+        <h2>Detection tracks</h2>
+        <div class="cop-list" id="track-list">
+          <div class="empty">No detection tracks</div>
+        </div>
+      </div>
+
+      <div class="cop-section">
+        <h2>Missions</h2>
+        <div class="cop-list" id="mission-list">
+          <div class="empty">No missions</div>
+        </div>
+      </div>
+
+      <div class="cop-section">
+        <h2>Commands</h2>
+        <div class="cop-list" id="command-list">
+          <div class="empty">No commands</div>
         </div>
       </div>
 

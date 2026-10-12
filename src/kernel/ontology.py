@@ -1,9 +1,8 @@
 """
 Canonical object names for the year-1 kernel.
 
-Existing Pydantic models live in src.asset_integration.models and
-src.operator_app.app. This module does not replace them. It is the
-shared vocabulary so Gotham-style growth does not fork a second world model.
+Each name has one Pydantic model in src.kernel.models. Other packages
+import those classes or re-export them. Do not define a second copy.
 """
 
 from enum import Enum
@@ -25,18 +24,19 @@ class ObjectName(str, Enum):
 
 KERNEL_OBJECTS = tuple(item.value for item in ObjectName)
 
-# Map ontology name -> current implementation module.
-# Update this table when a model is promoted or merged.
+# Ontology name -> the one model. Zone polygons are keep-in, keep-out, or
+# AOI. Keep-out rejects a GOTO inside the polygon. A breach raises an Alert.
+# OperatorAction is not wired into login.
 IMPLEMENTATION = {
-    ObjectName.ASSET: "src.asset_integration.models.AssetInfo / AssetState",
-    ObjectName.POSITION: "src.asset_integration.models.Position",
-    ObjectName.TELEMETRY: "src.asset_integration.models.Telemetry",
-    ObjectName.COMMAND: "src.asset_integration.models.Command",
-    ObjectName.MISSION: "src.command_control.mission_manager / operator_app.app",
-    ObjectName.TRACK: "src.ai_fusion.tracking / operator_app.app",
-    ObjectName.DETECTION: "src.ai_fusion.perception + EventType.DETECTION",
-    ObjectName.ALERT: "EventType.ALERT / operator_app Alert",
-    ObjectName.EVENT: "src.data_services.event_store.Event",
-    ObjectName.ZONE: "not implemented — add when missions need keep-in/out",
-    ObjectName.OPERATOR_ACTION: "Command.issued_by + Event",
+    ObjectName.ASSET: "src.kernel.models.Asset",
+    ObjectName.POSITION: "src.kernel.models.Position",
+    ObjectName.TELEMETRY: "src.kernel.models.Telemetry",
+    ObjectName.COMMAND: "src.kernel.models.Command",
+    ObjectName.MISSION: "src.kernel.models.Mission",
+    ObjectName.TRACK: "src.kernel.models.Track",
+    ObjectName.DETECTION: "src.kernel.models.Detection",
+    ObjectName.ALERT: "src.kernel.models.Alert",
+    ObjectName.EVENT: "src.kernel.models.Event",
+    ObjectName.ZONE: "src.kernel.models.Zone",
+    ObjectName.OPERATOR_ACTION: "src.kernel.models.OperatorAction",
 }

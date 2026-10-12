@@ -10,14 +10,12 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import random
-import aiosqlite
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
-from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,12 +23,45 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
-
+from src.kernel.models import (
+    Alert,
+    AlertLevel,
+    Asset,
+    AssetStatus,
+    AssetType,
+    Command,
+    CommandType,
+    Event,
+    Mission,
+    MissionStatus,
+    OperatorAction,
+    Telemetry,
+    Track,
+    TrackHistoryPoint,
+    TrackState,
+    TrackType,
+)
+from src.kernel.provenance import ProvenanceError, require_command_event
+from src.data_services.repositories import (
+    InMemoryOperatorActionRepository,
+    OperatorSnapshotStore,
+    open_snapshot,
+)
+from src.operator_app.command_gate import stamp
+from src.operator_app.live_feed import (
+    bind_snapshot,
+    cop_frame,
+    hub,
+    notify_live,
+    start_redis_listener,
+)
+from src.operator_app.zones import apply_zone_check, keep_out_zone
 # ── Paths ──────────────────────────────────────────────────────────────
 BASE = Path(__file__).resolve().parent
 STATIC = BASE / "static"
 TEMPLATES = BASE / "templates"
-DB_PATH = BASE.parent.parent / "data" / "cnc.db"   # ~/cnc/data/cnc.db
+# CNC_SNAPSHOT_PATH isolates a second process. Unset, this stays data/cnc.db.
+DB_PATH = Path(os.environ["CNC_SNAPSHOT_PATH"]) if os.environ.get("CNC_SNAPSHOT_PATH") else BASE.parent.parent / "data" / "cnc.db"
 
 # ── Domain models ──────────────────────────────────────────────────────
 def utcnow() -> datetime:
@@ -40,135 +71,15 @@ def dt_to_str(dt: datetime) -> str:
     return dt.isoformat()
 
 def str_to_dt(s: str) -> datetime:
-    return datetime.fromisoformat(s)
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
-class AssetType(str, Enum):
-    UAV = "uav"
-    UGV = "ugv"
-
-class AssetStatus(str, Enum):
-    OFFLINE = "offline"
-    IDLE = "idle"
-    MISSION = "mission"
-    RETURNING = "returning"
-    EMERGENCY = "emergency"
-    LOST = "lost"
-
-class CommandType(str, Enum):
-    TAKEOFF = "takeoff"
-    LAND = "land"
-    RTL = "rtl"
-    HOLD = "hold"
-    GOTO = "goto"
-    SET_SPEED = "set_speed"
-    CUSTOM = "custom"
-
-class AlertLevel(str, Enum):
-    INFO = "info"
-    WARNING = "warning"
-    CRITICAL = "critical"
-
-class MissionStatus(str, Enum):
-    PLANNED = "planned"
-    ACTIVE = "active"
-    COMPLETED = "completed"
-    ABORTED = "aborted"
-
-class TrackType(str, Enum):
-    FRIENDLY = "friendly"
-    HOSTILE = "hostile"
-    NEUTRAL = "neutral"
-    UNKNOWN = "unknown"
-
-class TrackState(str, Enum):
-    ACTIVE = "active"
-    STALE = "stale"
-    LOST = "lost"
-
-class Asset(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid4()))
-    name: str
-    asset_type: AssetType
-    status: AssetStatus = AssetStatus.OFFLINE
-    lat: float = 0.0
-    lon: float = 0.0
-    alt: float = 0.0
-    heading: float = 0.0
-    speed: float = 0.0
-    battery: float = 100.0
-    capabilities: list[str] = Field(default_factory=list)
-    home_lat: Optional[float] = None
-    home_lon: Optional[float] = None
-    last_seen: datetime = Field(default_factory=utcnow)
-
-class Telemetry(BaseModel):
-    asset_id: str
-    timestamp: datetime = Field(default_factory=utcnow)
-    lat: float
-    lon: float
-    alt: float = 0.0
-    heading: float = 0.0
-    speed: float = 0.0
-    battery: float = 100.0
-    status: AssetStatus = AssetStatus.IDLE
-
-class Command(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid4()))
-    asset_id: str
-    command_type: CommandType
-    parameters: dict[str, Any] = Field(default_factory=dict)
-    issued_at: datetime = Field(default_factory=utcnow)
-    issued_by: str = "operator"
-    status: str = "pending"
-    result: Optional[dict[str, Any]] = None
-
-class Alert(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid4()))
-    level: AlertLevel
-    title: str
-    message: str
-    asset_id: Optional[str] = None
-    timestamp: datetime = Field(default_factory=utcnow)
-    acknowledged: bool = False
-    source: str = "system"
-
-class Mission(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid4()))
-    name: str
-    description: str = ""
-    status: MissionStatus = MissionStatus.PLANNED
-    assigned_assets: list[str] = Field(default_factory=list)
-    waypoints: list[dict[str, float]] = Field(default_factory=list)
-    area: Optional[dict[str, Any]] = None
-    objectives: list[str] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=utcnow)
-    started_at: Optional[datetime] = None
-    completed_at: Optional[datetime] = None
-
-class TrackHistoryPoint(BaseModel):
-    timestamp: datetime
-    lat: float
-    lon: float
-    alt: float = 0.0
-    speed: float = 0.0
-    heading: float = 0.0
-
-class Track(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid4()))
-    label: str = "unknown"
-    track_type: TrackType = TrackType.FRIENDLY
-    state: TrackState = TrackState.ACTIVE
-    lat: float
-    lon: float
-    alt: float = 0.0
-    heading: float = 0.0
-    speed: float = 0.0
-    confidence: float = 0.9
-    source_asset_ids: list[str] = Field(default_factory=list)
-    first_seen: datetime = Field(default_factory=utcnow)
-    last_update: datetime = Field(default_factory=utcnow)
-    attributes: dict[str, Any] = Field(default_factory=dict)
-    history: list[TrackHistoryPoint] = Field(default_factory=list)
+def as_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 class SensorObservation(BaseModel):
     sensor_id: str = "sim-sensor"
@@ -186,114 +97,9 @@ LOST_AFTER_SEC = 25.0
 CONFIDENCE_DECAY = 0.04
 MAX_HISTORY = 30
 
-# ── SQLite Persistence ─────────────────────────────────────────────────
-class Database:
-    def __init__(self, path: Path):
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-
-    async def connect(self):
-        self.db = await aiosqlite.connect(self.path)
-        self.db.row_factory = aiosqlite.Row
-        await self._create_tables()
-
-    async def close(self):
-        await self.db.close()
-
-    async def _create_tables(self):
-        await self.db.executescript("""
-        CREATE TABLE IF NOT EXISTS assets (
-            id TEXT PRIMARY KEY,
-            data TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS missions (
-            id TEXT PRIMARY KEY,
-            data TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS tracks (
-            id TEXT PRIMARY KEY,
-            data TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS alerts (
-            id TEXT PRIMARY KEY,
-            data TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS observations (
-            id TEXT PRIMARY KEY,
-            data TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-        """)
-        await self.db.commit()
-
-    async def save_asset(self, asset: Asset):
-        await self.db.execute(
-            "INSERT OR REPLACE INTO assets (id, data, updated_at) VALUES (?, ?, ?)",
-            (asset.id, asset.model_dump_json(), dt_to_str(utcnow()))
-        )
-        await self.db.commit()
-
-    async def load_assets(self) -> list[Asset]:
-        async with self.db.execute("SELECT data FROM assets") as cursor:
-            rows = await cursor.fetchall()
-        return [Asset.model_validate_json(r["data"]) for r in rows]
-
-    async def save_mission(self, mission: Mission):
-        await self.db.execute(
-            "INSERT OR REPLACE INTO missions (id, data, updated_at) VALUES (?, ?, ?)",
-            (mission.id, mission.model_dump_json(), dt_to_str(utcnow()))
-        )
-        await self.db.commit()
-
-    async def load_missions(self) -> list[Mission]:
-        async with self.db.execute("SELECT data FROM missions") as cursor:
-            rows = await cursor.fetchall()
-        return [Mission.model_validate_json(r["data"]) for r in rows]
-
-    async def save_track(self, track: Track):
-        # Keep history short in DB to avoid huge rows
-        t = track.model_copy()
-        t.history = t.history[-10:]
-        await self.db.execute(
-            "INSERT OR REPLACE INTO tracks (id, data, updated_at) VALUES (?, ?, ?)",
-            (track.id, t.model_dump_json(), dt_to_str(utcnow()))
-        )
-        await self.db.commit()
-
-    async def load_tracks(self) -> list[Track]:
-        async with self.db.execute("SELECT data FROM tracks") as cursor:
-            rows = await cursor.fetchall()
-        return [Track.model_validate_json(r["data"]) for r in rows]
-
-    async def save_alert(self, alert: Alert):
-        await self.db.execute(
-            "INSERT OR REPLACE INTO alerts (id, data, created_at) VALUES (?, ?, ?)",
-            (alert.id, alert.model_dump_json(), dt_to_str(alert.timestamp))
-        )
-        await self.db.commit()
-
-    async def load_alerts(self, limit: int = 50) -> list[Alert]:
-        async with self.db.execute(
-            "SELECT data FROM alerts ORDER BY created_at DESC LIMIT ?", (limit,)
-        ) as cursor:
-            rows = await cursor.fetchall()
-        return [Alert.model_validate_json(r["data"]) for r in rows]
-
-    async def save_observation(self, obs: SensorObservation):
-        oid = str(uuid4())
-        await self.db.execute(
-            "INSERT INTO observations (id, data, created_at) VALUES (?, ?, ?)",
-            (oid, obs.model_dump_json(), dt_to_str(utcnow()))
-        )
-        await self.db.commit()
-
-# ── In-memory store (now backed by SQLite) ─────────────────────────────
+# ── In-memory store (snapshot file opened via open_snapshot) ───────────
 class EntityStore:
-    def __init__(self, db: Database):
+    def __init__(self, db: OperatorSnapshotStore):
         self.db = db
         self.assets: dict[str, Asset] = {}
         self.alerts: dict[str, Alert] = {}
@@ -303,7 +109,7 @@ class EntityStore:
         self._lock = asyncio.Lock()
 
     async def recover(self):
-        """Load last known state from SQLite on startup."""
+        """Load last known state from the snapshot and the durable command tape."""
         for a in await self.db.load_assets():
             self.assets[a.id] = a
         for m in await self.db.load_missions():
@@ -312,7 +118,11 @@ class EntityStore:
             self.tracks[t.id] = t
         for al in await self.db.load_alerts(30):
             self.alerts[al.id] = al
-        print(f"[DB] Recovered {len(self.assets)} assets, {len(self.missions)} missions, {len(self.tracks)} tracks")
+        restored = _rehydrate_operator_history(self)
+        print(
+            f"[DB] Recovered {len(self.assets)} assets, {len(self.missions)} missions, "
+            f"{len(self.tracks)} tracks, {len(self.commands)} commands, {restored} events"
+        )
 
     async def upsert_asset(self, asset: Asset) -> Asset:
         async with self._lock:
@@ -320,7 +130,7 @@ class EntityStore:
         await self.db.save_asset(asset)
         return asset
 
-    async def update_from_telem(self, t: Telemetry) -> Optional[Asset]:
+    async def update_from_telem(self, t: Telemetry, *, persist: bool = True) -> Optional[Asset]:
         async with self._lock:
             a = self.assets.get(t.asset_id)
             if not a:
@@ -329,13 +139,16 @@ class EntityStore:
             a.heading, a.speed, a.battery = t.heading, t.speed, t.battery
             a.status = t.status
             a.last_seen = t.timestamp
-        await self.db.save_asset(a)
+        if persist:
+            await self.db.save_asset(a)
         return a
 
     async def add_alert(self, alert: Alert) -> Alert:
         async with self._lock:
             self.alerts[alert.id] = alert
         await self.db.save_alert(alert)
+        _ingest_quietly("ingest_alert", alert.model_dump(mode="json"), actor="operator")
+        notify_live()
         return alert
 
     async def list_alerts(self, unacked_only: bool = True) -> list[Alert]:
@@ -348,6 +161,7 @@ class EntityStore:
         async with self._lock:
             self.missions[mission.id] = mission
         await self.db.save_mission(mission)
+        notify_live()
         return mission
 
     async def get_mission(self, mission_id: str) -> Optional[Mission]:
@@ -360,6 +174,8 @@ class EntityStore:
         async with self._lock:
             self.tracks[track.id] = track
         await self.db.save_track(track)
+        _ingest_quietly("ingest_track", track.model_dump(mode="json"), actor="operator")
+        notify_live()
         return track
 
     async def get_track(self, track_id: str) -> Optional[Track]:
@@ -490,15 +306,79 @@ class TrackManager:
             ))
         return track
 
+    def _asset_for_track(self, track: Track) -> Optional[Asset]:
+        for asset_id, track_id in self._asset_to_track.items():
+            if track_id == track.id:
+                asset = self.store.assets.get(asset_id)
+                if asset is not None:
+                    return asset
+        for asset_id in track.source_asset_ids or []:
+            asset = self.store.assets.get(asset_id)
+            if asset is not None and (
+                track.track_type == TrackType.FRIENDLY or self._asset_to_track.get(asset_id) == track.id
+            ):
+                return asset
+        for asset in self.store.assets.values():
+            if asset.name and asset.name == track.label and track.track_type == TrackType.FRIENDLY:
+                return asset
+        return None
+
+    async def _presence_alert(self, asset: Asset, *, lost: bool) -> None:
+        """One warning per asset. The lost text replaces the offline text."""
+        alert_id = f"presence-{asset.id}"
+        if lost:
+            title = "Asset lost"
+            message = f"{asset.name} is offline and its track is lost"
+        else:
+            title = "Asset offline"
+            message = f"{asset.name} went offline"
+        existing = self.store.alerts.get(alert_id)
+        if existing is not None and existing.message == message:
+            return
+        if existing is not None and not lost:
+            return
+        alert = Alert(
+            id=alert_id,
+            level=AlertLevel.WARNING,
+            title=title,
+            message=message,
+            asset_id=asset.id,
+            source="lifecycle",
+            timestamp=existing.timestamp if existing is not None else utcnow(),
+        )
+        await self.store.add_alert(alert)
+
+    async def _track_lost_alert(self, track: Track) -> None:
+        asset = self._asset_for_track(track)
+        if asset is None:
+            alert_id = f"presence-track-{track.id}"
+            if alert_id in self.store.alerts:
+                return
+            label = track.label or track.id
+            await self.store.add_alert(Alert(
+                id=alert_id,
+                level=AlertLevel.WARNING,
+                title="Track lost",
+                message=f"Track {label} is lost",
+                source="lifecycle",
+            ))
+            return
+        if asset.status in (AssetStatus.OFFLINE, AssetStatus.ERROR, AssetStatus.LOST):
+            if asset.status != AssetStatus.LOST:
+                asset.status = AssetStatus.LOST
+                await self.store.upsert_asset(asset)
+        await self._presence_alert(asset, lost=True)
+
     async def lifecycle_tick(self):
         now = utcnow()
         for track in await self.store.list_tracks():
-            age = (now - track.last_update).total_seconds()
+            age = (now - as_utc(track.last_update)).total_seconds()
             if age > LOST_AFTER_SEC:
                 if track.state != TrackState.LOST:
                     track.state = TrackState.LOST
                     track.confidence = max(0.05, track.confidence - CONFIDENCE_DECAY * 2)
                     await self.store.upsert_track(track)
+                    await self._track_lost_alert(track)
             elif age > STALE_AFTER_SEC:
                 track.state = TrackState.STALE
                 track.confidence = max(0.1, track.confidence - CONFIDENCE_DECAY)
@@ -507,6 +387,11 @@ class TrackManager:
                 if track.state != TrackState.ACTIVE:
                     track.state = TrackState.ACTIVE
                     await self.store.upsert_track(track)
+        for asset in list(self.store.assets.values()):
+            if asset.status == AssetStatus.OFFLINE:
+                await self._presence_alert(asset, lost=False)
+            elif asset.status == AssetStatus.LOST:
+                await self._presence_alert(asset, lost=True)
 
 # ── Mock assets (unchanged logic) ──────────────────────────────────────
 class MockAsset:
@@ -631,12 +516,17 @@ class MockAsset:
 # ── Platform ───────────────────────────────────────────────────────────
 class Platform:
     def __init__(self):
-        self.db = Database(DB_PATH)
+        self.db = open_snapshot(DB_PATH)
         self.store = EntityStore(self.db)
         self.track_manager = TrackManager(self.store)
         self.adapters: dict[str, MockAsset] = {}
+        self.operator_action_repo = InMemoryOperatorActionRepository()
         self._task = self._lifecycle_task = None
         self._running = False
+
+    @property
+    def operator_actions(self) -> list[OperatorAction]:
+        return self.operator_action_repo.records
 
     async def register(self, mock: MockAsset):
         # If we recovered an asset with the same name, reuse its id for continuity
@@ -656,16 +546,75 @@ class Platform:
             message=f"{mock.asset.name} connected", asset_id=mock.id,
         ))
 
-    async def issue(self, cmd: Command) -> Command:
+    def _reject_keep_out(self, cmd: Command) -> Command | None:
+        """Fail a GOTO inside a keep-out before the command transaction."""
+        if cmd.command_type != CommandType.GOTO:
+            return None
+        params = cmd.parameters or {}
+        try:
+            lat = float(params["lat"])
+            lon = float(params["lon"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        zone = keep_out_zone(lat, lon)
+        if zone is None:
+            return None
+        from src.data_services.event_store import EventType, event_store
+        cmd.status = "failed"
+        cmd.result = {"error": "keep-out", "zone_id": zone.id}
+        event_store.add(
+            EventType.COMMAND,
+            f"goto rejected keep-out {zone.id}",
+            asset_id=cmd.asset_id,
+            actor=cmd.issued_by,
+            data={
+                "operator_id": cmd.issued_by,
+                "command_id": cmd.id,
+                "command_type": cmd.command_type.value,
+                "status": "failed",
+                "payload": dict(cmd.parameters),
+                "zone_id": zone.id,
+                "reason": "keep-out",
+            },
+        )
         self.store.commands[cmd.id] = cmd
-        ad = self.adapters.get(cmd.asset_id)
-        if not ad:
+        notify_live()
+        return cmd
+
+    async def issue(self, cmd: Command) -> Command:
+        """Record the command Event, prove it matches, then dispatch.
+
+        A keep-out GOTO is rejected with an Event and is not dispatched.
+        A failed Event write raises ProvenanceError and does not call the adapter.
+        """
+        rejected = self._reject_keep_out(cmd)
+        if rejected is not None:
+            return rejected
+        from src.data_services.event_store import event_store
+        try:
+            _record_command_event(cmd)
+            require_command_event(cmd, event_store.get_by_asset(cmd.asset_id))
+        except ProvenanceError:
+            cmd.status = "failed"
+            cmd.result = {"error": "command event was not recorded"}
+            raise
+        except Exception as exc:
+            cmd.status = "failed"
+            cmd.result = {"error": "command event was not recorded"}
+            raise ProvenanceError("command event was not recorded") from exc
+        self.store.commands[cmd.id] = cmd
+        if cmd.asset_id not in self.adapters:
             cmd.status = "failed"
             cmd.result = {"error": "asset not found"}
-        else:
-            ok = await ad.send_command(cmd)
-            cmd.status = "sent" if ok else "failed"
-        _record_command_event(cmd)
+            from src.data.outbox import mark_command_published
+            from src.operator_app.command_bus import remember_command
+            mark_command_published(cmd.id)
+            remember_command(cmd)
+            notify_live()
+            return cmd
+        from src.operator_app.command_bus import dispatch_command
+        await dispatch_command(self, cmd)
+        notify_live()
         return cmd
 
     async def start(self):
@@ -674,9 +623,37 @@ class Platform:
         self._running = True
         self._task = asyncio.create_task(self._telem_loop())
         self._lifecycle_task = asyncio.create_task(self._lifecycle_loop())
+        from src.data.bus import current_mode
+        from src.data.outbox import start_relay
+        from src.data.pipeline import start_pipeline
+        from src.operator_app.command_bus import start_command_bridge
+
+        async def _consumers_up() -> None:
+            if await start_pipeline():
+                await start_command_bridge(self.adapters.get)
+
+        async def _consumers_again() -> None:
+            from src.data.pipeline import restart_pipeline
+            from src.operator_app.command_bus import restart_command_bridge
+            if await restart_pipeline():
+                await restart_command_bridge(self.adapters.get)
+
+        if current_mode() == "nats":
+            await start_relay(_consumers_up, on_reconnect=_consumers_again)
+            await _consumers_up()
+        elif await start_pipeline():
+            await start_command_bridge(self.adapters.get)
 
     async def stop(self):
         self._running = False
+        from src.data.bus import get_bus
+        from src.data.outbox import stop_relay
+        from src.data.pipeline import stop_pipeline
+        from src.operator_app.command_bus import stop_command_bridge
+        await stop_relay()
+        await stop_command_bridge()
+        await stop_pipeline()
+        await get_bus().close()
         for t in (self._task, self._lifecycle_task):
             if t:
                 t.cancel()
@@ -690,18 +667,33 @@ class Platform:
         while self._running:
             try:
                 for ad in list(self.adapters.values()):
-                    t = await ad.get_telemetry()
-                    if t:
-                        asset = await self.store.update_from_telem(t)
-                        if asset:
-                            await self.track_manager.update_from_asset(asset)
-                        if t.battery < 20:
+                    poll = getattr(ad, "poll_telemetry", None)
+                    if poll is not None:
+                        t = poll()
+                    else:
+                        t = await ad.get_telemetry()
+                    if not t:
+                        continue
+                    # Stamp is already on t. Push before publish and the snapshot write.
+                    asset = await self.store.update_from_telem(t, persist=False)
+                    if asset is not None:
+                        notify_live()
+                        await apply_zone_check(self.store, asset)
+                        await self.track_manager.update_from_asset(asset)
+                    if poll is not None:
+                        await ad.publish_vendor_telemetry(t)
+                    if asset is not None:
+                        await self.store.db.save_asset(asset)
+                    if t.battery < 20:
+                        alert_id = f"battery-{t.asset_id}"
+                        if alert_id not in self.store.alerts:
                             await self.store.add_alert(Alert(
+                                id=alert_id,
                                 level=AlertLevel.WARNING, title="Low battery",
                                 message=f"{ad.asset.name} at {t.battery:.0f}%",
                                 asset_id=ad.id, source="health",
                             ))
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(0.1)
             except asyncio.CancelledError: break
             except Exception: await asyncio.sleep(1.0)
 
@@ -716,32 +708,106 @@ class Platform:
 # ── FastAPI ────────────────────────────────────────────────────────────
 platform = Platform()
 
-def _record_command_event(cmd: Command) -> None:
-    """Every issued command carries operator id, time, and asset id."""
+
+async def _cop_snapshot() -> dict:
+    return await platform.store.snapshot()
+
+
+bind_snapshot(_cop_snapshot)
+
+
+async def _register_demo_fleet() -> None:
+    """Two UAVs and two UGVs, each kept on its sim id and home."""
+    from src.operator_app.demo_fleet import demo_adapters
+    for adapter in demo_adapters():
+        wanted = adapter.sim.info.asset_id
+        await platform.register(adapter)
+        if adapter.asset.id == wanted:
+            continue
+        previous = adapter.asset.id
+        platform.adapters.pop(previous, None)
+        platform.store.assets.pop(previous, None)
+        adapter.asset.id = wanted
+        platform.adapters[wanted] = adapter
+        await platform.store.upsert_asset(adapter.asset)
+
+def _rehydrate_operator_history(store: EntityStore) -> int:
+    """Copy recent commands and events from the durable store into memory."""
+    from src.data_services.event_store import event_store
+    from src.data_services.repositories import get_repositories
+
+    repos = get_repositories()
+    for row in repos.list_recent_commands(15):
+        try:
+            command = Command(
+                id=row["id"],
+                asset_id=row["asset_id"],
+                command_type=row["command_type"],
+                parameters=row.get("parameters") or {},
+                issued_by=row.get("issued_by") or "operator",
+                issued_at=row["issued_at"],
+                status=row.get("status") or "pending",
+                result=row.get("result"),
+            )
+        except Exception as exc:
+            print(f"[DB] skip command {row.get('id')}: {exc}")
+            continue
+        store.commands[command.id] = command
+    return event_store.restore(repos.list_recent_events(500))
+
+
+def _ingest_quietly(function_name: str, payload: dict, actor: str) -> None:
     try:
-        from src.data_services.event_store import EventType, event_store
-        event_store.add(
-            EventType.COMMAND,
-            f"{cmd.command_type.value} ({cmd.status})",
-            asset_id=cmd.asset_id,
-            data={
-                "operator_id": cmd.issued_by,
-                "command_id": cmd.id,
-                "command_type": cmd.command_type.value,
-                "status": cmd.status,
-            },
-        )
+        from src.data import ingest as ingest_mod
+        getattr(ingest_mod, function_name)(payload, actor=actor)
     except Exception as exc:
-        print(f"[Event] command record failed: {exc}")
+        print(f"[ingest] {function_name} failed: {exc}")
+
+
+def _record_command_event(cmd: Command) -> Event:
+    """Write the command, its Event, and the outbox row. Raises when that commit fails."""
+    from src.data.outbox import enqueue_issued
+    from src.data.sequence import next_command_seq
+    from src.data_services.event_store import EventType, event_store
+    if cmd.seq <= 0:
+        cmd.seq = next_command_seq(cmd.asset_id)
+    event = event_store.add(
+        EventType.COMMAND,
+        f"{cmd.command_type.value} ({cmd.status})",
+        asset_id=cmd.asset_id,
+        actor=cmd.issued_by,
+        persist=False,
+        data={
+            "operator_id": cmd.issued_by,
+            "command_id": cmd.id,
+            "command_type": cmd.command_type.value,
+            "status": cmd.status,
+            "payload": cmd.parameters,
+            "seq": cmd.seq,
+        },
+    )
+    enqueue_issued(cmd, event)
+    _ingest_quietly(
+        "ingest_command",
+        {
+            "command_id": cmd.id,
+            "asset_id": cmd.asset_id,
+            "command_type": cmd.command_type.value,
+            "parameters": cmd.parameters,
+            "issued_by": cmd.issued_by,
+            "issued_at": dt_to_str(cmd.issued_at),
+            "status": cmd.status,
+        },
+        actor=cmd.issued_by,
+    )
+    return event
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await platform.start()
-    from simulations.simple_assets import create_demo_fleet
-    from src.operator_app.adapters.sim_asset_adapter import SimAssetAdapter
-    for sim in create_demo_fleet().values():
-        await platform.register(SimAssetAdapter(sim))
+    start_redis_listener()
+    await _register_demo_fleet()
     yield
     await platform.stop()
 
@@ -784,10 +850,57 @@ async def list_assets():
 async def list_tracks():
     return [t.model_dump(mode="json") for t in await platform.store.list_tracks()]
 
+@app.post("/assets/{asset_id}/detect")
+async def mark_detection(asset_id: str, lat: float | None = None, lon: float | None = None):
+    """A UAV detection becomes a track the operator can hand to the nearest UGV."""
+    from src.kernel.models import Detection
+    from src.operator_app.coordinate import track_from_detection
+    asset = platform.store.assets.get(asset_id)
+    if asset is None:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    if asset.asset_type != AssetType.UAV:
+        raise HTTPException(status_code=400, detail="Detection comes from a UAV")
+    detection = Detection(
+        asset_id=asset_id,
+        lat=asset.lat if lat is None else lat,
+        lon=asset.lon if lon is None else lon,
+        confidence=0.86,
+    )
+    track = track_from_detection(detection)
+    await platform.store.upsert_track(track)
+    return track.model_dump(mode="json")
+
+@app.post("/tracks/{track_id}/task-nearest-ugv")
+async def task_nearest_ugv(track_id: str):
+    from src.operator_app.coordinate import task_nearest_ugv as task_ugv
+    try:
+        issued = await task_ugv(platform, track_id)
+    except ProvenanceError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return issued.model_dump(mode="json")
+
 @app.post("/assets/{asset_id}/command")
 async def send_command(asset_id: str, body: CommandRequest):
-    cmd = Command(asset_id=asset_id, command_type=body.command_type, parameters=body.parameters)
-    return (await platform.issue(cmd)).model_dump(mode="json")
+    issued_by = stamp(asset_id, body.command_type.value)
+    cmd = Command(
+        asset_id=asset_id,
+        command_type=body.command_type,
+        parameters=body.parameters,
+        issued_by=issued_by,
+    )
+    platform.operator_action_repo.add(OperatorAction(
+        time=cmd.issued_at,
+        actor=issued_by,
+        asset_id=asset_id,
+        action=body.command_type.value,
+        command_id=cmd.id,
+        payload=dict(body.parameters),
+    ))
+    try:
+        issued = await platform.issue(cmd)
+    except ProvenanceError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return issued.model_dump(mode="json")
 
 @app.post("/sensors/observe")
 async def sensor_observe(obs: SensorObservation):
@@ -849,6 +962,14 @@ async def start_mission(mission_id: str):
                                          message=f"Mission '{mission.name}' is now ACTIVE", source="mission"))
     return mission.model_dump(mode="json")
 
+@app.post("/missions/{mission_id}/export")
+async def export_mission(mission_id: str):
+    mission = await platform.store.get_mission(mission_id)
+    if not mission:
+        raise HTTPException(404, "Mission not found")
+    from src.data.after_action import write_after_action
+    return write_after_action(mission.id, list(mission.assigned_assets))
+
 @app.post("/missions/{mission_id}/abort")
 async def abort_mission(mission_id: str):
     mission = await platform.store.get_mission(mission_id)
@@ -863,11 +984,19 @@ async def abort_mission(mission_id: str):
 @app.websocket("/ws/cop")
 async def ws_cop(ws: WebSocket):
     await ws.accept()
+    hub.loop = asyncio.get_running_loop()
+    queue = hub.subscribe()
     try:
+        await ws.send_json(await cop_frame(await platform.store.snapshot()))
         while True:
-            await ws.send_json(await platform.store.snapshot())
-            await asyncio.sleep(1.0)
-    except WebSocketDisconnect: pass
+            frame = await queue.get()
+            await ws.send_json(frame)
+    except WebSocketDisconnect:
+        pass
     except Exception:
-        try: await ws.close()
-        except Exception: pass
+        try:
+            await ws.close()
+        except Exception:
+            pass
+    finally:
+        hub.unsubscribe(queue)

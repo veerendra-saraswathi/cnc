@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 import json
 from pprint import pprint
-from datetime import datetime
+from datetime import datetime, timezone
 
 from src.command_control.coordinator import MissionCoordinator
 from src.asset_integration.models import Position, AssetType, Telemetry
@@ -36,7 +36,7 @@ def publish_telemetry(mqtt: MQTTClient, telemetry_list: list[Telemetry]):
 def publish_mission_status(mqtt: MQTTClient, summary: dict):
     payload = {
         "mission_id": summary["mission_id"],
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "assets": summary["assets"],
         "tasks": summary["tasks"],
     }

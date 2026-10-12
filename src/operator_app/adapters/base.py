@@ -41,6 +41,11 @@ class AssetAdapter(abc.ABC):
     async def get_telemetry(self) -> Optional[Telemetry]:
         """Latest telemetry sample (or None if offline)."""
 
+    async def publish_vendor_telemetry(self, raw):
+        """Validate kernel Telemetry and publish it. Invalid samples go to cnc.dlq."""
+        from src.operator_app.adapters.telemetry_publish import accept_vendor_telemetry
+        return await accept_vendor_telemetry(raw)
+
     async def start(self) -> None:
         self._running = True
         await self.connect()
