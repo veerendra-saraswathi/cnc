@@ -1,18 +1,19 @@
 # RCI acceptance test report
 
-**Date:** 12 October 2026  
-**Commit:** `473de7eba09a61e18146b85136ebfca9de6b8536`  
-**Worktree:** dirty. The machine record counted 59 paths at the start of the run. This report and the Word file bring the count to 61.  
-**Branch:** `main`, ahead of `origin/main` by 2  
-**Machine record:** `docs/acceptance_m5.json`
+**Date:** 13 October 2026  
+**Code under test:** `7868a5188aa62cc29352c251a40218a950e81e91`  
+**Worktree at measurement:** clean. `git status --porcelain` counted 0 paths.  
+**Branch:** `main`, ahead of `origin/main` by 3  
+**Machine record:** `docs/acceptance_m5.json` (this file is the live result; the 12 October record is in git history at `473de7e`)  
+**Previous measurement:** 12 October 2026, commit `473de7eba09a61e18146b85136ebfca9de6b8536`, dirty worktree (59 paths at the start of that run)
 
 ## Result
 
-Criteria 10.1, 10.2, 10.3, and 10.4 passed on one scripted run of `scripts/acceptance_run.py`. Wall clock was 13 minutes 38 seconds (817.8 s), including an 11-minute cruise and a measured 30.0-second NATS outage.
+Criteria 10.1, 10.2, 10.3, and 10.4 passed on one full run of `scripts/acceptance_run.py` (`--quick` was not used). Wall clock was 13 minutes 55 seconds (834.8 s), from `2026-10-12T20:23:58Z` to `2026-10-12T20:37:52Z`, including an 11-minute cruise and a measured 30.0-second NATS outage.
 
-The fault story diverged from the expected column in three places. A command issued while NATS was down stayed `pending` after the broker accepted connections again. Stopping `ugv-02` set the asset `offline` and, after 32 seconds, the friendly track `lost`, with no Alert. With Redis stopped, the dashboard kept drawing the fleet from the operator entity store. Postgres was not on that path.
+All four faults matched the expected column. On 12 October, three of the four did not.
 
-Telemetry p95 on this laptop was **1,395 ms**. The acceptance target for this run is telemetry p95 under 500 ms. That target was missed. GOTO and alert times are reported below. The repository documents do not state a numeric target for those two.
+Telemetry p95 on this laptop was **26 ms** (7,659 samples). The acceptance target for this run is telemetry p95 under 500 ms. That target was met. Every sample was under 500 ms. The 12 October p95 was 1,395 ms, and every sample that day was at least 516 ms.
 
 ## Environment
 
@@ -31,12 +32,12 @@ Telemetry p95 on this laptop was **1,395 ms**. The acceptance target for this ru
 | NATS | `nats:2.10` container `cnc-nats-1`, JetStream, port 4222 |
 | Postgres | `timescale/timescaledb-ha:pg16` container `cnc-timescale-1`, left running. The operator process did not use it. |
 | Process settings | `CNC_BUS=nats`, `STORAGE_BACKEND` unset (duckdb) |
-| Acceptance files | `/tmp/cnc-m5/cnc.duckdb`, `/tmp/cnc-m5/cnc.db` |
+| Acceptance files | `/tmp/cnc-m6/cnc.duckdb`, `/tmp/cnc-m6/cnc.db` |
 | Dashboard | `http://127.0.0.1:8765/` HTTP 200, one `/ws/cop` client |
 
-`CNC_DUCKDB_PATH` and `CNC_SNAPSHOT_PATH` select those files. Unset, the process still uses `data/cnc.duckdb` and `data/cnc.db`. The acceptance process used the temporary paths so it would not take the file lock of another operator process.
+`CNC_DUCKDB_PATH` and `CNC_SNAPSHOT_PATH` select those files. Unset, the process still uses `data/cnc.duckdb` and `data/cnc.db`. Port 8000 was free for the whole run, so this process did not share JetStream durables or Redis keys with another operator.
 
-A `uvicorn --reload` server was already listening on port 8000 with `CNC_BUS=nats`. It shared the JetStream durable consumers and the Redis keys with this run, so it was stopped for the measurement and started again afterward.
+`cnc-nats-1` and `cnc-redis` were the only containers stopped. Both were running again at the end (`action: left` after they had been started). `cnc-timescale-1` was not stopped.
 
 ## Scenario
 
@@ -49,69 +50,91 @@ A `uvicorn --reload` server was already listening on port 8000 with `CNC_BUS=nat
 | ugv-01 | Wolf-1 | UGV | 17.3820, 78.4840 |
 | ugv-02 | Wolf-2 | UGV | 17.3880, 78.4920 |
 
-One HTTP client and one WebSocket client drove the dashboard. The script issued GOTO and HOLD through `POST /assets/{id}/command`, created mission `c7989d00-2039-48e5-856d-e80e27f2fdb1` ("M5 acceptance"), and started it through the HTTP mission routes. A UAV detection created track `det-b45262d6`, and `POST /tracks/{id}/task-nearest-ugv` tasked the nearest UGV. The cruise issued a GOTO about every 20 seconds and armed a temporary keep-out around a UAV about every 45 seconds, then removed that zone. Faults followed: stop `cnc-nats-1` for 30 seconds, stop the `ugv-02` adapter and wait 32 seconds, stop `cnc-redis`, then restart the operator process. Both containers were running at the end (`action: left` after they had been started again).
+One HTTP client and one WebSocket client drove the dashboard. The script issued GOTO and HOLD through `POST /assets/{id}/command`, created mission `86bddd2d-1886-48a4-be21-d63542ba6006`, and started it through the HTTP mission routes. A UAV detection created track `det-d5948df1`, and `POST /tracks/{id}/task-nearest-ugv` tasked the nearest UGV. The cruise issued a GOTO about every 20 seconds and armed a temporary keep-out around a UAV about every 45 seconds, then removed that zone. Faults followed: stop `cnc-nats-1` for 30 seconds, stop the `ugv-02` adapter and wait 32 seconds, stop `cnc-redis` for 15 seconds, then restart the operator process.
 
 ## Criteria
 
 | Id | Result | Evidence |
 | --- | --- | --- |
-| 10.1 Integration of 2 UAV + 2 UGV | Pass | Four distinct ids and homes on one socket. Movement after the opening GOTO: uav-01 180.5 m, uav-02 182.1 m, ugv-01 60.0 m, ugv-02 61.7 m. |
-| 10.2 Information exchange among assets | Pass | `POST /assets/uav-01/detect` returned track `det-b45262d6` (source `uav-01`, 17.3865, 78.4875). Task command `ed11e8b1-98ec-476a-8525-8ae83bab5738` went to `ugv-02`, status `sent`, actor `operator:op-1`, issued `2026-10-12T18:51:22.183246Z`. DuckDB events `538b0724` (`goto (pending)`, stored `2026-10-13 00:21:22.183394`) and `5545dad9` (`ack goto (ok)`, stored `2026-10-13 00:21:22.4614`). OperatorAction `task-nearest-ugv` links the same command id. Idempotency recall is one success. |
-| 10.3 C2 through the platform | Pass | HOLD `f9217303-c37d-4b3f-8c3d-5dc699334a35` on `uav-02`, status `sent`, ack true, actor `operator:op-1`, issued `2026-10-12T18:51:22.711561Z`. Events `cf95272a` and `a39e6957` (`ack hold (ok)`). Mission `c7989d00-2039-48e5-856d-e80e27f2fdb1` created and started over HTTP, status `active` at `2026-10-12T18:51:23.121858Z`. Mission-start GOTOs are issued with actor `mission`. Operator HTTP commands use `operator:op-1`. |
+| 10.1 Integration of 2 UAV + 2 UGV | Pass | Four distinct ids and homes on one socket. Movement after the opening GOTO: uav-01 181.3 m, uav-02 176.8 m, ugv-01 58.8 m, ugv-02 58.7 m. |
+| 10.2 Information exchange among assets | Pass | `POST /assets/uav-01/detect` returned track `det-d5948df1` (source `uav-01`, 17.3865, 78.4875). Task command `9f01d4be-cfe5-4e13-b754-f51fc094381f` went to `ugv-02`, status `sent`, actor `operator:op-1`, issued `2026-10-12T20:24:15.212627Z`. DuckDB events `1edf4a40` (`goto (pending)`, stored `2026-10-13 01:54:15.212732`) and `817cfc65` (`ack goto (ok)`, stored `2026-10-13 01:54:15.259172`). OperatorAction `task-nearest-ugv` links the same command id. Idempotency recall is one success. |
+| 10.3 C2 through the platform | Pass | HOLD `08c475d4-4622-4fbe-8cb3-901f8b7cd41f` on `uav-02`, status `sent`, ack true, actor `operator:op-1`, issued `2026-10-12T20:24:15.304666Z`. Events `0d17f1fd` and `a4ed84d7` (`ack hold (ok)`). Mission `86bddd2d-1886-48a4-be21-d63542ba6006` created and started over HTTP, status `active` at `2026-10-12T20:24:15.421797Z`. Mission-start GOTOs are issued with actor `mission`. Operator HTTP commands use `operator:op-1`. |
 | 10.4 One operator, one dashboard | Pass | `GET /` returned 200 and referenced `dashboard.js`. One socket subscriber. The frame carried assets, tracks, alerts, missions, recent commands, and zones for all four fleet ids. Operator-issued commands in the run shared actor `operator:op-1`. |
 
-DuckDB event timestamps above are the naive values stored in `/tmp/cnc-m5/cnc.duckdb`. They match the UTC `issued_at` values shifted to the laptop's local zone (UTC+5:30).
+DuckDB event timestamps above are the naive values stored in `/tmp/cnc-m6/cnc.duckdb`. They match the UTC `issued_at` values shifted to the laptop's local zone (UTC+5:30).
 
 ## Faults
 
-Expected text is the acceptance brief. The actual column is what this run recorded.
+The expected column is the acceptance brief for this run. The 12 October column is what commit `473de7e` recorded. The 13 October column is what commit `7868a51` recorded in the same process, with the containers restored afterwards.
 
-| Fault | Expected | Actual |
+| Fault | 12 October (`473de7e`) | 13 October (`7868a51`) |
 | --- | --- | --- |
-| NATS stopped for 30 s | The command stays pending, then is delivered once when NATS returns. | `docker stop cnc-nats-1` held the broker down for 30.0 s. GOTO `7520bbb3-9290-4530-b08e-ae045866c822` on `ugv-01` (17.42, 78.52) returned HTTP 200 in 94 ms with status `pending` and result `{"queued": true}`, actor `operator:op-1`, issued `2026-10-12T19:02:25.220205Z`. Outbox `01a1317e-a2c4-7fd9-98fb-c099865049e1` on `cnc.command.ugv-01` stayed unpublished (`attempts` 1). Port 4222 accepted connections after `docker start`. For the following 45 s the same process left the command `pending`, `published_at` null, and recall empty. The live JetStream client was not replaced. |
-| One vehicle adapter stopped | The vehicle is marked lost and an Alert is raised. | `ugv-02` (Wolf-2) was `offline` immediately. Friendly track `3ac2be98-e79d-4cb9-a33f-54b523691060` was `active` at that instant and `lost` after 32 s. Alerts whose text contains "lost": 0. New alerts after the stop: 0. |
-| Redis unreachable | The common operating picture falls back to Postgres. | `docker stop cnc-redis`. A following HOLD returned HTTP 200. The socket frame still contained all four fleet assets, and `uav-01` had moved about 169 m from the pre-outage fix. `redis_down` was true. After `docker start cnc-redis` and another HOLD, `redis_down` was still true and the frame still contained the four assets. The operator picture is the entity store (memory plus the SQLite snapshot). `cop_frame` does not query Postgres. `STORAGE_BACKEND` for the process was duckdb. The HOLD itself stayed `pending`, because the NATS client from the earlier outage was still closed. |
-| Process restart | Operator state comes back. | The new process loaded `uav-01`, `uav-02`, `ugv-01`, `ugv-02` and mission `c7989d00-2039-48e5-856d-e80e27f2fdb1`. Five prior tracks were present. 22 of the prior alert ids were present (the snapshot load keeps 30). Recent commands after restart: none. The in-memory event ring held 3 new rows. DuckDB still had 92 event rows, including hold events `cf95272a` / `a39e6957` and task events `538b0724` / `5545dad9`. The queued GOTO's outbox row was published at stored time `2026-10-13 00:34:37.514065` (`attempts` 3). One ack event followed: `ack goto (ok)` at `2026-10-13 00:34:38.618726`. Recall for `ugv-01` + `7520bbb3-9290-4530-b08e-ae045866c822` is a single success. The sim target was 17.42, 78.52, alt 0. |
+| NATS stopped for 30 s | Matched: no. GOTO `7520bbb3-9290-4530-b08e-ae045866c822` on `ugv-01` returned HTTP 200 in 94 ms, status `pending`, result `{"queued": true}`. Outbox `01a1317e-a2c4-7fd9-98fb-c099865049e1` stayed unpublished (`attempts` 1). After port 4222 accepted connections, the same process left the command `pending` for 45 s. `published_at` stayed null and recall stayed empty. Delivery happened only after a later process restart. | Matched: yes. GOTO `0e99e896-637b-4345-823f-5345dace542d` on `ugv-01` (17.42, 78.52) returned HTTP 200 in 233 ms at `2026-10-12T20:35:18.419362Z`, status `pending`, result `{"queued": true}`, actor `operator:op-1`. The broker was down for 30.0 s and port 4222 accepted connections after `docker start` at `2026-10-12T20:35:48Z`. The same process published outbox `01a131d3-ad13-7012-b4f2-fa315e8610df` (`cnc.command.ugv-01`) at stored time `2026-10-13 02:05:54.655964` (`attempts` 1). The command then read status `sent`, result `{"ack": true}`. Ack event `6c057911` is stored at `2026-10-13 02:06:24.681499`. Recall is one success. The sim target was 17.42, 78.52, alt 0. The following process restart did not send it again. |
+| One vehicle adapter stopped | Matched: no. `ugv-02` (Wolf-2) was `offline` immediately. Friendly track `3ac2be98-e79d-4cb9-a33f-54b523691060` was `active`, then `lost` after 32 s. Alerts whose text contains "lost": 0. | Matched: yes. `ugv-02` was `offline` immediately and friendly track `a9760f5d-e186-4d99-8328-b19adb19b7fa` (Wolf-2) was `active`. After 32 s the asset and the track were both `lost`. One new alert, id `presence-ugv-02`, level `warning`, title "Asset lost", message "Wolf-2 is offline and its track is lost". A second warning, `presence-track-det-d5948df1`, covers the detection track that has no asset ("Track object_of_interest is lost"). A further lifecycle tick did not add another alert for `ugv-02`. |
+| Redis unreachable | Matched: no. The socket kept the four fleet assets and `uav-01` had moved about 169 m, with `redis_down` true. After `docker start`, `redis_down` stayed true for the rest of the process. `fell_back_to_postgres` was false. The HOLD issued in that window stayed `pending` because the NATS client from the earlier outage was still closed. | Matched: yes. With Redis stopped, a HOLD returned HTTP 200 with body status `sent` in 128 ms. The socket frame still contained all four fleet assets, `redis_down` was true, and `overlay_loaded` was false. `uav-01` was at the same coordinates as the pre-outage fix (0.0 m); `last_seen` advanced from `2026-10-12T20:36:56.986615Z` to `2026-10-12T20:37:14.170630Z`. `ugv-02` was already `lost` from the adapter fault. `fell_back_to_postgres` stayed false: this process was on duckdb, and `cop_frame` does not query Postgres. After `docker start` at `2026-10-12T20:37:14Z`, within the 8 s poll, `redis_down` was false and `overlay_loaded` was true. One socket subscriber remained. |
+| Process restart | Matched: yes, for assets and the mission. The new process loaded `uav-01`, `uav-02`, `ugv-01`, `ugv-02` and mission `c7989d00-2039-48e5-856d-e80e27f2fdb1`. Five tracks and 22 of the prior alert ids came back. Recent command ids: none. The event ring held 3 new rows. DuckDB still had 92 event rows. The queued GOTO was published by this new process (`attempts` 3) and acked once. | Matched: yes, including commands and the event ring. The child logged `Recovered 4 assets, 1 missions, 5 tracks, 15 commands, 92 events`. Assets `uav-01`, `uav-02`, `ugv-01`, `ugv-02` and mission `86bddd2d-1886-48a4-be21-d63542ba6006` were back. Five prior tracks and 24 of the prior alert ids were present (the snapshot load keeps 30). Fifteen recent command ids were reloaded, including the queued GOTO `0e99e896-637b-4345-823f-5345dace542d` with status `sent` and result `{"ack": true}`. The event ring held 50 events. DuckDB still had 92 event rows, including hold events `0d17f1fd` / `a4ed84d7` and task events `1edf4a40` / `817cfc65`. The outbox row was already published by the previous process, so the child recall is empty and the child did not move the sim target again. |
 
 ## Latency
 
-Samples were taken on this laptop while NATS and Redis were up, before the fault windows. Percentiles use linear interpolation on the sorted samples (the same convention as NumPy's default percentile). Times are milliseconds, rounded to the nearest millisecond.
+Samples were taken on this laptop while NATS and Redis were up, before the fault windows. Percentiles use linear interpolation on the sorted samples (the same convention as NumPy's default percentile). Times below are milliseconds, rounded to the nearest millisecond. Raw M6 telemetry p95 is 25.644 ms.
 
-| Path | n | p50 | p95 | p99 | Target |
-| --- | --- | --- | --- | --- | --- |
-| Telemetry sample (`asset.last_seen`) to WebSocket frame | 3,493 | 860 | 1,395 | 2,969 | p95 under 500 ms. **Missed** on this laptop. |
-| GOTO HTTP issue to ack response | 37 | 165 | 437 | 531 | No numeric target in the repo docs. |
-| Alert timestamp to WebSocket frame | 14 | 953 | 1,734 | 1,942 | No numeric target in the repo docs. |
-| Keep-out zone insert to the frame that shows the alert | 14 | 1,830 | 3,370 | 3,431 | Includes the telemetry scan (about 0.8 s) plus the push above. |
+| Path | Run | n | p50 | p95 | p99 | min | max |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Telemetry sample (`asset.last_seen`) to WebSocket frame | 12 Oct | 3,493 | 860 | 1,395 | 2,969 | 516 | 6,382 |
+| Telemetry sample (`asset.last_seen`) to WebSocket frame | 13 Oct | 7,659 | 14 | 26 | 38 | 2 | 260 |
+| GOTO HTTP issue to ack response | 12 Oct | 37 | 165 | 437 | 531 | 34 | 568 |
+| GOTO HTTP issue to ack response | 13 Oct | 37 | 85 | 175 | 329 | 39 | 406 |
+| Alert timestamp to WebSocket frame | 12 Oct | 14 | 953 | 1,734 | 1,942 | — | — |
+| Alert timestamp to WebSocket frame | 13 Oct | 15 | 6 | 25 | 26 | 3 | 27 |
+| Keep-out zone insert to the frame that shows the alert | 12 Oct | 14 | 1,830 | 3,370 | 3,431 | — | — |
+| Keep-out zone insert to the frame that shows the alert | 13 Oct | 15 | 197 | 383 | 464 | 47 | 484 |
 
-No sample had a negative clock difference. The minimum telemetry sample was 516 ms, so every measured frame in this set was already over the 500 ms line.
+The telemetry target is p95 under 500 ms. 12 October missed it. 13 October met it: 0 of 7,659 samples were at or above 500 ms. The mass of the 13 October samples sits under 20 ms (3,271 in 0–10 ms, 3,332 in 10–20 ms, 853 in 20–30 ms, 179 in 30–50 ms, 21 in 50–100 ms, 2 in 100–200 ms, 1 at 260 ms). No sample had a negative clock difference on either run.
 
-## Fix applied before this run
+The repository documents do not state a numeric target for GOTO, alert raise, or zone insert. Those three paths are shorter on 13 October as well. The zone-insert figure on 12 October included the old telemetry scan of about 0.8 s.
 
-The restart shake-out published the queued GOTO and the command consumer answered `asset not found` because the demo fleet was not registered yet. That ack completed the JetStream delivery, so the vehicle never executed the command.
+The 13 October picture pushes a frame when the snapshot changes. The sim stamps a sample on poll, the operator loop notifies the socket before the durable write, and a frame already in flight is followed by one frame that carries the latest snapshot. The poll interval on that loop is 0.1 s. The Redis pub/sub listen socket is not given a 0.5 s read timeout.
 
-`src/operator_app/command_bus.py` now raises when the adapter is missing. The pull consumer naks the message and JetStream redelivers it. On this run the redelivery executed once: one `ack goto (ok)` event, one recall success, and the sim target at 17.42, 78.52.
+## Audit failure and ProvenanceError
 
-No other product behavior was changed to match the expected fault column. The same-process NATS recovery, the lost-track Alert, and a Postgres picture were left as measured.
+Two different gates were easy to collapse into one sentence on 12 October. They are separate.
 
-Bringing the operator process back on port 8000 exposed a second defect. `ensure_jetstream` logged a failed dial with `str(exc).splitlines()[0]`. A `TimeoutError` from the NATS client has an empty message, so that lookup raised `IndexError` and the process exited during startup. The handler now uses the exception class name when the message is empty, and the dial still returns false. `src/data/test_bus.py` covers an empty `TimeoutError`.
+`docs/ARCHITECTURE_DATA.md` still says the acceptance demo stays fail-open and that `CNC_AUDIT_STRICT` stays `0`. That sentence means a failed durable write is logged and delivery can continue, so a database blip does not strand a vehicle. This run did not set `CNC_AUDIT_STRICT`. The architecture note was left as it stood.
+
+`Platform.issue` is the in-memory gate. It writes the command Event and calls `require_command_event` before `dispatch_command`. If that Event cannot be recorded, `issue` sets status `failed`, result `{"error": "command event was not recorded"}`, and raises `ProvenanceError`. The HTTP route turns that into 503. The adapter has not been called.
+
+The 13 October code adds the durable gate on every path that hands a command to an adapter or to JetStream. `command_audit_recorded` must read the events row for that command id. A missing row or a query error fails the command with the same result object, and `_send_local` returns without `send_command`. The JetStream pull consumer raises `RuntimeError("command event was not recorded")`, so the message is nak'd and the adapter is not called. That is the fail-closed behaviour for command dispatch. It does not depend on `CNC_AUDIT_STRICT`.
+
+Telemetry and fusion writes still log a failure and continue. A database blip on those paths does not stop the picture loop.
+
+The operator stamp on this run is still the stub session `operator:op-1`.
+
+## What this commit changed relative to 12 October
+
+Commit `7868a51` is the tree that was measured. It also contains the durable store, JetStream outbox, and live picture that were uncommitted on 12 October. The gaps named in the 12 October report, and what this run showed:
+
+- Telemetry reaches the socket when the snapshot changes. p95 moved from 1,395 ms to 26 ms.
+- After the broker returns, the JetStream client reconnects and the outbox relay publishes pending rows in the same process. The queued GOTO was published once (`attempts` 1) and acked once.
+- An asset that goes offline, and a track that goes lost, raise one warning alert per asset (`presence-{asset_id}`). A track with no asset uses `presence-track-{track_id}`.
+- A failed Redis ping retries with backoff. After Redis returned, `overlay_loaded` became true in the same process. `PostgresSnapshot.connect` creates the operator snapshot table when `STORAGE_BACKEND=postgres`. This acceptance process stayed on duckdb, so that connect path was not exercised here. The unit suite covers construction without a dial, and a Postgres round trip.
+- Command dispatch fails closed when the durable command event is missing, as described above.
+- Restart reloads the newest commands and the recent event ring from the store, along with assets, missions, tracks, and alerts.
+
+Two earlier fixes are inside the same commit and were already described on 12 October: a missing adapter naks the JetStream message instead of completing the delivery, and an empty `TimeoutError` from the NATS dial no longer aborts process startup.
 
 ## Regression suite
 
-After the acceptance run, from the repository root on the default store paths:
+After this acceptance run, from the repository root on the default store paths:
 
 `.venv/bin/python -m pytest -q --tb=line`
 
-83 passed in 27.36 s. Exit code 0. The count includes the empty-`TimeoutError` dial test added after the acceptance run.
+92 passed in 8.85 s. Exit code 0. The acceptance script is not collected by pytest. The same 92 passed in 14.14 s on this commit before the acceptance run.
 
 ## Known gaps
 
-- The operator picture is the entity store and the SQLite snapshot. `PostgresSnapshot.connect` is unimplemented, so this process cannot start with `STORAGE_BACKEND=postgres`.
-- A failed Redis ping is remembered for the life of the process. Frames continue from the entity store, and the process does not resume the Redis overlay when Redis returns.
-- `lifecycle_tick` moves a track to `lost` after 25 seconds without telemetry. It does not raise an Alert. `adapter.stop()` sets the asset `offline` immediately.
-- After the broker returns, a process that still holds the old JetStream client leaves unpublished outbox rows pending. Delivery of the queued command happened in the restarted process.
-- Restart restores SQLite assets, missions, tracks, and the newest alerts. The in-memory command list starts empty. The in-memory event ring starts empty. DuckDB event rows remain.
-- The security stamp is the stub session `operator:op-1`. Audit failure stays fail-open.
-- The fleet is the in-process sim (`SimAssetAdapter`), not ArduPilot SITL or ROS 2.
+- The security stamp is the stub session `operator:op-1`.
+- The fleet is the in-process sim (`SimAssetAdapter`). ArduPilot SITL and ROS 2 were not in this run.
 - Latency figures are this laptop's loop, NATS, Redis, and one WebSocket client. They are not a field-radio measurement.
-- `docs/ARCHITECTURE_DATA.md` was left as it stood.
+- The operator picture on this run is the entity store plus the SQLite snapshot, with Redis as an overlay. `STORAGE_BACKEND` was duckdb. `cop_frame` does not query Postgres. `PostgresSnapshot.connect` is implemented for a process that sets `STORAGE_BACKEND=postgres`; this run did not.
+- `docs/ARCHITECTURE_DATA.md` still describes `CNC_AUDIT_STRICT=0` as fail-open for a failed durable write. Command dispatch on this commit refuses to send when the durable command event is missing, and the flag was not set to `1`.
+- The dashboard was checked through the acceptance HTTP and WebSocket client on port 8765. It was not opened in a browser, and the 860 px layout was not visually checked.
