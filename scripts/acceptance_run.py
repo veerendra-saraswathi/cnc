@@ -27,6 +27,7 @@ import math
 import os
 import platform
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -137,24 +138,79 @@ def stats(samples: list[float]) -> dict:
     }
 
 
+def _kill_group(proc: subprocess.Popen) -> None:
+    """SIGKILL the child and the session it leads. Already-exited is fine."""
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _read_pipe(pipe, sink: list[str]) -> None:
+    try:
+        sink.append(pipe.read())
+    except Exception:
+        sink.append("")
+
+
 def run_cmd(args: list[str], timeout: float = 40) -> subprocess.CompletedProcess:
-    return subprocess.run(
+    """Run a CLI and return on a monotonic deadline.
+
+    subprocess.run on POSIX kills a timed-out child and then process.wait()
+    with no second deadline. A Docker CLI stuck in the Desktop API proxy
+    holds that wait. The M7 fault clock advanced 1,809 s with no
+    "did not return" line. This helper does not call that wait.
+    """
+    proc = subprocess.Popen(
         args,
         cwd=ROOT,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout,
-        check=False,
+        start_new_session=True,
     )
+    out_sink: list[str] = []
+    err_sink: list[str] = []
+    threads = [
+        threading.Thread(target=_read_pipe, args=(proc.stdout, out_sink), daemon=True),
+        threading.Thread(target=_read_pipe, args=(proc.stderr, err_sink), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + max(0.1, timeout)
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
+    else:
+        _kill_group(proc)
+        reap_until = time.monotonic() + 0.5
+        while time.monotonic() < reap_until and proc.poll() is None:
+            time.sleep(0.02)
+    for thread in threads:
+        thread.join(0.2)
+    code = proc.returncode if proc.returncode is not None else 124
+    stdout = out_sink[0] if out_sink else ""
+    stderr = err_sink[0] if err_sink else ""
+    if proc.returncode is None and not stderr:
+        stderr = "command exceeded deadline"
+    return subprocess.CompletedProcess(args, code, stdout, stderr)
 
 
-def container_info(name: str) -> dict:
+def container_info(name: str, timeout: float = 20) -> dict:
     if name not in ALLOWED_CONTAINERS:
         raise RuntimeError(f"refusing to inspect {name}")
     proc = run_cmd(
         ["docker", "inspect", "-f", "{{.Name}}\t{{.State.Status}}\t{{.Config.Image}}", name],
-        timeout=20,
+        timeout=timeout,
     )
+    if proc.returncode == 124 or "exceeded deadline" in (proc.stderr or ""):
+        return {"name": name, "present": True, "status": "unknown", "error": "inspect timed out"}
     if proc.returncode != 0:
         return {"name": name, "present": False, "error": scrub(proc.stderr.strip())}
     parts = proc.stdout.strip().split("\t")
@@ -172,49 +228,44 @@ def container_info(name: str) -> dict:
 def _wait_until_stopped(name: str, seconds: float = 20.0) -> dict:
     """Poll until Docker reports the container is not running."""
     deadline = time.monotonic() + seconds
-    last = container_info(name)
+    last = container_info(name, timeout=2)
     while time.monotonic() < deadline:
-        if last.get("status") != "running":
+        if last.get("status") not in {"running", "unknown"}:
             return last
-        time.sleep(0.5)
-        last = container_info(name)
+        time.sleep(0.3)
+        last = container_info(name, timeout=2)
     return last
 
 
 def docker_stop(name: str) -> dict:
-    info = container_info(name)
-    if not info.get("present"):
+    info = container_info(name, timeout=2)
+    if not info.get("present") and info.get("status") != "unknown":
         return {"ok": False, "action": "stop", **info}
-    if info.get("status") != "running":
+    if info.get("status") not in {"running", "unknown"}:
         return {"ok": False, "action": "stop", "detail": "not running", **info}
     log(f"docker stop {name}")
-    stderr = ""
-    try:
-        # -t 8 sends SIGKILL if the process ignores SIGTERM. Docker Desktop's
-        # API sometimes never returns from `docker stop` even after the task
-        # has exited, which used to abort the fault phase at 45 s.
-        proc = run_cmd(["docker", "stop", "-t", "8", name], timeout=20)
-        stderr = scrub(proc.stderr.strip())
-        ok = proc.returncode == 0
-    except subprocess.TimeoutExpired:
+    started = time.monotonic()
+    # NATS 2.10 lame-ducks for 2 minutes on SIGTERM, then waits for clients.
+    # -t 2 cuts that short. The CLI is capped at 6 s. Inspect decides.
+    # The whole stop, including a SIGKILL, stays inside 12 s.
+    proc = run_cmd(["docker", "stop", "-t", "2", name], timeout=6)
+    stderr = scrub(proc.stderr.strip())
+    info = container_info(name, timeout=2)
+    if info.get("status") in {"running", "unknown"}:
         log(f"docker stop {name} did not return; killing")
-        try:
-            proc = run_cmd(["docker", "kill", name], timeout=15)
-            stderr = scrub(proc.stderr.strip())
-            ok = proc.returncode == 0
-        except subprocess.TimeoutExpired:
-            ok = False
-            stderr = "docker stop and docker kill timed out"
-    info = _wait_until_stopped(name)
-    if info.get("status") != "running":
-        ok = True
+        remain = max(1.0, 12.0 - (time.monotonic() - started) - 1.0)
+        kill = run_cmd(["docker", "kill", name], timeout=min(4.0, remain))
+        stderr = scrub(kill.stderr.strip()) or stderr
+        info = _wait_until_stopped(name, seconds=max(0.5, 12.0 - (time.monotonic() - started)))
+    elapsed = time.monotonic() - started
+    ok = info.get("status") not in {"running", "unknown", None}
+    if ok:
         _stopped.add(name)
-    else:
-        ok = False
     return {
         "ok": ok,
         "action": "stop",
         "stderr": stderr,
+        "elapsed_s": round(elapsed, 3),
         **info,
     }
 
@@ -238,6 +289,9 @@ def docker_start(name: str) -> dict:
             continue
         if proc.returncode == 0:
             break
+        if proc.returncode == 124:
+            time.sleep(1.0)
+            continue
         text = proc.stderr or ""
         if "already exists" not in text and "is already running" not in text:
             break
@@ -422,6 +476,32 @@ def build_plan(args) -> Plan:
     return Plan(660, 30, 45, 32, 15, 20, 45, 12, True)
 
 
+def _merge_rows(current, incoming) -> list[dict]:
+    by_id = {row.get("id"): dict(row) for row in (current or []) if isinstance(row, dict) and row.get("id")}
+    for row in incoming or []:
+        if not isinstance(row, dict) or not row.get("id"):
+            continue
+        by_id[row["id"]] = {**by_id.get(row["id"], {}), **row}
+    return list(by_id.values())
+
+
+def _merge_frame(latest: dict | None, frame: dict) -> dict:
+    """Fold a per-asset delta into the last full picture. A snapshot replaces it."""
+    if frame.get("type") != "delta" or not latest:
+        return frame
+    merged = dict(latest)
+    if frame.get("timestamp"):
+        merged["timestamp"] = frame["timestamp"]
+    if "assets" in frame:
+        merged["assets"] = _merge_rows(merged.get("assets"), frame.get("assets"))
+    if "tracks" in frame:
+        merged["tracks"] = _merge_rows(merged.get("tracks"), frame.get("tracks"))
+    for key in ("alerts", "missions", "recent_commands", "zones"):
+        if key in frame:
+            merged[key] = frame[key]
+    return merged
+
+
 class CopClient:
     """One dashboard socket. Latency samples are taken only while measuring."""
 
@@ -472,7 +552,7 @@ class CopClient:
                         frame = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
-                    self.latest = frame
+                    self.latest = _merge_frame(self.latest, frame)
                     self.frames += 1
                     self._telem(frame, recv)
                     self._alert(frame, recv)
@@ -1762,8 +1842,8 @@ async def scenario(args) -> int:
             "client": frozen_client,
             "server": frozen_server,
             "mavlink_stream_request_hz": 10,
-            "uav_source_time": "unavailable; GLOBAL_POSITION_INT has time_boot_ms, not unix time",
-            "ugv_source_time": "ROS header stamp when it is within 30s of wall clock, otherwise omitted",
+            "uav_source_time": "SYSTEM_TIME offset: unix usec minus boot ms, plus GLOBAL_POSITION_INT time_boot_ms",
+            "ugv_source_time": "Gazebo header converted with a sim-to-wall offset taken when the stamp is not unix time",
         }
         # Samples can be long. Keep them in the JSON; the markdown report quotes the stats.
         RESULT_PATH.parent.mkdir(parents=True, exist_ok=True)

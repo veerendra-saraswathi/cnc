@@ -14,6 +14,10 @@ from src.data.subjects import (
     MAX_AGE_SECONDS,
     MAX_BYTES,
     STREAMS,
+    TELEMETRY_ASSETS,
+    TELEMETRY_HZ,
+    TELEMETRY_MAX_BYTES,
+    TELEMETRY_MSG_BYTES,
     ack_subject,
     command_subject,
     telemetry_subject,
@@ -53,11 +57,17 @@ def test_subjects_and_stream_retention():
         "CNC_ALERT",
         "CNC_DLQ",
     }
+    assert TELEMETRY_MAX_BYTES == TELEMETRY_ASSETS * TELEMETRY_HZ * MAX_AGE_SECONDS * TELEMETRY_MSG_BYTES
     for spec in STREAMS:
         assert spec.max_age_seconds == MAX_AGE_SECONDS == 24 * 60 * 60
-        assert spec.max_bytes == MAX_BYTES == 1024 ** 3
+        if spec.name == "CNC_TELEMETRY":
+            assert spec.max_bytes == TELEMETRY_MAX_BYTES
+            assert spec.max_bytes > MAX_BYTES
+        else:
+            assert spec.max_bytes == MAX_BYTES == 1024 ** 3
         assert spec.storage == "file"
         assert spec.discard == "old"
+        assert spec.duplicate_window >= 0
 
 
 def test_bus_does_not_import_fusion_or_the_operator_app():

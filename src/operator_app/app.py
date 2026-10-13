@@ -53,6 +53,7 @@ from src.operator_app.live_feed import (
     cop_frame,
     hub,
     notify_live,
+    serialize_frame,
     start_redis_listener,
 )
 from src.operator_app.zones import apply_zone_check, keep_out_zone
@@ -175,7 +176,7 @@ class EntityStore:
             self.tracks[track.id] = track
         await self.db.save_track(track)
         _ingest_quietly("ingest_track", track.model_dump(mode="json"), actor="operator")
-        notify_live()
+        notify_live(track_id=track.id)
         return track
 
     async def get_track(self, track_id: str) -> Optional[Track]:
@@ -670,6 +671,8 @@ class Platform:
         await stop_relay()
         await stop_command_bridge()
         await stop_pipeline()
+        from src.operator_app.adapters.telemetry_publish import drain_telemetry_publishes
+        await drain_telemetry_publishes()
         await get_bus().close()
         for t in (self._task, self._lifecycle_task):
             if t:
@@ -700,7 +703,7 @@ class Platform:
         )
 
     async def _durable_telem(self, queue: asyncio.Queue) -> None:
-        """Zone, track, JetStream, and sqlite. One worker keeps the snapshot writes ordered."""
+        """Track update and sqlite. JetStream acks run on their own tasks."""
         while True:
             adapter, sample, publish = await queue.get()
             try:
@@ -728,10 +731,11 @@ class Platform:
                 queue.task_done()
 
     async def _telem_loop(self):
-        from src.operator_app.telem_timing import offer
+        from src.operator_app.adapters.telemetry_publish import accept_vendor_telemetry
 
-        # Durable work stays off this loop so a frame is not waiting on sqlite or JetStream.
-        queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+        # Track and sqlite stay off this loop. JetStream acks are their own tasks,
+        # so a slow PubAck cannot fill a queue and drop the sample before publish.
+        queue: asyncio.Queue = asyncio.Queue()
         worker = asyncio.create_task(self._durable_telem(queue))
         try:
             while self._running:
@@ -746,13 +750,15 @@ class Platform:
                             continue
                         asset = await self.store.update_from_telem(sample, persist=False)
                         self._record_poll(ad, sample)
+                        if poll is not None:
+                            await accept_vendor_telemetry(sample)
                         if asset is not None:
                             # DuckDB zone checks are in memory. Alerts must not wait on JetStream.
                             await apply_zone_check(self.store, asset)
-                            notify_live()
+                            notify_live(asset.id)
                         # The frame task reads last_seen before the next asset is polled.
                         await asyncio.sleep(0)
-                        offer(queue, (ad, sample, poll is not None))
+                        queue.put_nowait((ad, sample, False))
                     await asyncio.sleep(0.1)
                 except asyncio.CancelledError:
                     break
@@ -1074,10 +1080,16 @@ async def ws_cop(ws: WebSocket):
     hub.loop = asyncio.get_running_loop()
     queue = hub.subscribe()
     try:
-        await ws.send_json(await cop_frame(await platform.store.snapshot()))
+        initial = await cop_frame(await platform.store.snapshot())
+        initial["type"] = "snapshot"
+        # One serialization. Later frames are already text.
+        await ws.send_text(serialize_frame(initial))
         while True:
             frame = await queue.get()
-            await ws.send_json(frame)
+            if isinstance(frame, str):
+                await ws.send_text(frame)
+            else:
+                await ws.send_text(serialize_frame(frame))
     except WebSocketDisconnect:
         pass
     except Exception:

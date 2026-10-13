@@ -52,6 +52,30 @@ def header_source_ms(stamp_sec: float | None, now_sec: float, *, skew_s: float =
     return float(stamp_sec) * 1000.0
 
 
+def sim_stamp_to_wall_ms(
+    stamp_sec: float | None,
+    now_sec: float,
+    offset_s: float | None,
+    *,
+    skew_s: float = 30.0,
+) -> tuple[float | None, float | None]:
+    """Convert a Gazebo sim stamp to unix milliseconds.
+
+    A stamp already near the wall clock is used as-is. A sim-time stamp keeps
+    one offset (wall minus sim) so later messages show the real delay. The
+    offset is taken again when the converted time is more than skew_s off.
+    """
+    if stamp_sec is None or stamp_sec <= 0:
+        return None, offset_s
+    stamp = float(stamp_sec)
+    now = float(now_sec)
+    if abs(now - stamp) <= skew_s:
+        return stamp * 1000.0, 0.0
+    if offset_s is None or abs(now - (stamp + float(offset_s))) > skew_s:
+        offset_s = now - stamp
+    return (stamp + float(offset_s)) * 1000.0, float(offset_s)
+
+
 def _yaw_from_quat(x: float, y: float, z: float, w: float) -> float:
     siny = 2.0 * (w * z + x * y)
     cosy = 1.0 - 2.0 * (y * y + z * z)
@@ -100,6 +124,7 @@ class ROS2Adapter(AssetAdapter):
         self._source_ms: float | None = None
         self._adapter_ms: float | None = None
         self._gap_ms: float | None = None
+        self._sim_offset_s: float | None = None
 
     @classmethod
     def from_spec(cls, spec) -> "ROS2Adapter":
@@ -244,9 +269,9 @@ class ROS2Adapter(AssetAdapter):
         stamp_sec = None
         if stamp is not None:
             stamp_sec = float(getattr(stamp, "sec", 0)) + float(getattr(stamp, "nanosec", 0)) / 1e9
-        source_ms = header_source_ms(stamp_sec, now_s)
         received = now_s * 1000.0
         with self._pose:
+            source_ms, self._sim_offset_s = sim_stamp_to_wall_ms(stamp_sec, now_s, self._sim_offset_s)
             self._east = float(pose.position.x)
             self._north = float(pose.position.y)
             self._heading = _yaw_from_quat(quat.x, quat.y, quat.z, quat.w)

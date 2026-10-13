@@ -15,7 +15,10 @@ services:
 
   nats:
     image: nats:2.10
+    # nats:2.10 has no lame-duck CLI flag. Docker's stop grace is 5 s, and the
+    # acceptance harness sends SIGKILL after 2 s, so a drain cannot hold the fault.
     command: ["-js", "--auth", "${NATS_TOKEN:?set NATS_TOKEN in .env}"]
+    stop_grace_period: 5s
     ports:
       - "${NATS_PORT:-4222}:4222"
 

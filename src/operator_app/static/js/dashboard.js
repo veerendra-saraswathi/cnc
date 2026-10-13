@@ -286,46 +286,79 @@ function renderAlerts(alerts) {
     </div>`).join("");
 }
 
+function mergeById(current, incoming) {
+  const next = Object.assign({}, current);
+  (incoming || []).forEach((item) => {
+    if (!item || !item.id) return;
+    next[item.id] = Object.assign({}, next[item.id] || {}, item);
+  });
+  return next;
+}
+
+function dropMarkers(markers, keep) {
+  Object.keys(markers).forEach((id) => {
+    if (keep[id]) return;
+    if (map) map.removeLayer(markers[id]);
+    delete markers[id];
+  });
+}
+
 function connectWS() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws/cop`);
   ws.onmessage = (ev) => {
     const snap = JSON.parse(ev.data);
-    document.getElementById("clock").textContent = new Date(snap.timestamp).toLocaleTimeString();
-
-    // Assets
-    const nextAssets = {};
-    (snap.assets || []).forEach((a) => {
-      nextAssets[a.id] = a;
-      upsertAssetMarker(a);
-    });
-    assets = nextAssets;
-    if (!mapFitted && map && Object.keys(assets).length > 0) {
-      const pts = Object.values(assets)
-        .filter((a) => finite(a.lat) !== null && finite(a.lon) !== null)
-        .map((a) => [a.lat, a.lon]);
-      if (pts.length > 0) {
-        map.fitBounds(pts, { padding: [40, 40], maxZoom: 15 });
-        mapFitted = true;
-      }
+    const isDelta = snap.type === "delta";
+    if (snap.timestamp) {
+      document.getElementById("clock").textContent = new Date(snap.timestamp).toLocaleTimeString();
     }
-    renderAssets();
-    if (selectedId && !assets[selectedId]) selectAsset(null);
-    else if (selectedId) selectAsset(selectedId);
 
-    // Tracks
-    const nextTracks = {};
-    (snap.tracks || []).forEach((t) => {
-      nextTracks[t.id] = t;
-      upsertTrackMarker(t);
-    });
-    tracks = nextTracks;
+    if (snap.assets) {
+      if (isDelta) {
+        assets = mergeById(assets, snap.assets);
+        snap.assets.forEach((a) => upsertAssetMarker(a));
+      } else {
+        const nextAssets = {};
+        snap.assets.forEach((a) => {
+          nextAssets[a.id] = a;
+          upsertAssetMarker(a);
+        });
+        dropMarkers(assetMarkers, nextAssets);
+        assets = nextAssets;
+      }
+      if (!mapFitted && map && Object.keys(assets).length > 0) {
+        const pts = Object.values(assets)
+          .filter((a) => finite(a.lat) !== null && finite(a.lon) !== null)
+          .map((a) => [a.lat, a.lon]);
+        if (pts.length > 0) {
+          map.fitBounds(pts, { padding: [40, 40], maxZoom: 15 });
+          mapFitted = true;
+        }
+      }
+      renderAssets();
+      if (selectedId && !assets[selectedId]) selectAsset(null);
+      else if (selectedId) selectAsset(selectedId);
+    }
 
-    renderAlerts(snap.alerts || []);
-    renderMissions(snap.missions || []);
-    renderCommands(snap.recent_commands || []);
-    renderDetectionTracks(snap.tracks || []);
-    renderZones(snap.zones || []);
+    if (snap.tracks) {
+      if (isDelta) {
+        tracks = mergeById(tracks, snap.tracks);
+        snap.tracks.forEach((t) => upsertTrackMarker(t));
+      } else {
+        const nextTracks = {};
+        snap.tracks.forEach((t) => {
+          nextTracks[t.id] = t;
+          upsertTrackMarker(t);
+        });
+        dropMarkers(trackMarkers, nextTracks);
+        tracks = nextTracks;
+      }
+      renderDetectionTracks(Object.values(tracks));
+    }
+    if (snap.alerts) renderAlerts(snap.alerts);
+    if (snap.missions) renderMissions(snap.missions);
+    if (snap.recent_commands) renderCommands(snap.recent_commands);
+    if (snap.zones) renderZones(snap.zones);
     const online = Object.values(assets).filter((a) => a.status !== "offline").length;
     document.getElementById("asset-count").textContent = `${online}/${Object.keys(assets).length}`;
   };

@@ -96,6 +96,8 @@ class MAVLinkAdapter(AssetAdapter):
         self._source_ms: float | None = None
         self._adapter_ms: float | None = None
         self._gap_ms: float | None = None
+        # unix ms at boot, from SYSTEM_TIME: time_unix_usec/1000 - time_boot_ms
+        self._boot_unix_ms: float | None = None
 
     @classmethod
     def from_spec(cls, spec) -> "MAVLinkAdapter":
@@ -247,6 +249,23 @@ class MAVLinkAdapter(AssetAdapter):
                 STREAM_HZ,
                 1,
             )
+            try:
+                # SYSTEM_TIME (id 2) at 1 Hz. GLOBAL_POSITION_INT only has time_boot_ms.
+                master.mav.command_long_send(
+                    sysid,
+                    comp,
+                    mav.MAV_CMD_SET_MESSAGE_INTERVAL,
+                    0,
+                    2,
+                    1_000_000,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            except Exception:
+                pass
 
     def _read_loop(self) -> None:
         master = self._master
@@ -298,9 +317,17 @@ class MAVLinkAdapter(AssetAdapter):
                 with self._pose:
                     self._last_text = text[:160]
             return
+        if kind == "SYSTEM_TIME":
+            unix_us = int(getattr(msg, "time_unix_usec", 0) or 0)
+            boot_ms = getattr(msg, "time_boot_ms", None)
+            if unix_us > 0 and boot_ms is not None:
+                with self._pose:
+                    self._boot_unix_ms = (unix_us / 1000.0) - float(boot_ms)
+            return
         if kind == "GLOBAL_POSITION_INT":
-            # No unix time on this message. The gap between receives is the SITL stream period.
+            # time_boot_ms becomes unix time once SYSTEM_TIME has set the offset.
             received = time.time() * 1000.0
+            boot_ms = getattr(msg, "time_boot_ms", None)
             with self._pose:
                 self._lat = msg.lat / 1.0e7
                 self._lon = msg.lon / 1.0e7
@@ -309,7 +336,8 @@ class MAVLinkAdapter(AssetAdapter):
                     self._heading = msg.hdg / 100.0
                 self._speed = math.hypot(msg.vx, msg.vy) / 100.0
                 self._have_fix = True
-                self._source_ms = None
+                if self._boot_unix_ms is not None and boot_ms is not None:
+                    self._source_ms = self._boot_unix_ms + float(boot_ms)
                 if self._adapter_ms is not None:
                     self._gap_ms = received - self._adapter_ms
                 self._adapter_ms = received

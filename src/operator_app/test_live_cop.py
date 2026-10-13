@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 import pytest
@@ -71,6 +72,9 @@ class _Socket:
 
     async def send_json(self, payload: dict) -> None:
         self.sent.append(payload)
+
+    async def send_text(self, payload: str) -> None:
+        self.sent.append(json.loads(payload))
 
     async def close(self) -> None:
         return None
@@ -177,13 +181,51 @@ def test_websocket_pushes_the_next_frame(monkeypatch):
             assert socket.sent, "initial frame was not pushed"
             platform.store.assets[asset_id] = asset
             notify_live()
-            deadline = time.monotonic() + 0.3
+            deadline = time.monotonic() + 1.0
             while time.monotonic() < deadline and len(socket.sent) < 2:
                 await asyncio.sleep(0.01)
             assert len(socket.sent) >= 2
             assert any(item["id"] == asset_id for item in socket.sent[-1]["assets"])
         finally:
             platform.store.assets.pop(asset_id, None)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(body())
+
+
+def test_one_asset_notify_is_a_delta(monkeypatch):
+    monkeypatch.setattr("src.operator_app.live_feed.read_redis_overlay", lambda: {})
+    monkeypatch.setattr("src.operator_app.live_feed.zone_rings", lambda: [])
+    first = Asset(id="delta-a", name="A", asset_type=AssetType.UAV, status=AssetStatus.IDLE, lat=17.2, lon=78.2)
+    second = Asset(id="delta-b", name="B", asset_type=AssetType.UGV, status=AssetStatus.IDLE, lat=17.3, lon=78.3)
+
+    async def body():
+        platform.store.assets["delta-a"] = first
+        platform.store.assets["delta-b"] = second
+        socket = _Socket()
+        task = asyncio.create_task(ws_cop(socket))
+        try:
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline and not socket.sent:
+                await asyncio.sleep(0.01)
+            assert socket.sent
+            assert socket.sent[0]["type"] == "snapshot"
+            before = len(socket.sent)
+            notify_live("delta-a")
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline and len(socket.sent) == before:
+                await asyncio.sleep(0.01)
+            delta = socket.sent[-1]
+            assert delta["type"] == "delta"
+            assert [item["id"] for item in delta["assets"]] == ["delta-a"]
+            assert "alerts" not in delta
+        finally:
+            platform.store.assets.pop("delta-a", None)
+            platform.store.assets.pop("delta-b", None)
             task.cancel()
             try:
                 await task

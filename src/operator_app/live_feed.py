@@ -2,9 +2,9 @@
 
 Redis supplies live positions when it answers. A failed ping waits on a
 backoff and is tried again, so the overlay returns without a process restart.
-Frames are pushed when state changes. One frame is in flight, then one more
-with the latest snapshot. Missions, command phase, and zones come from the
-operator snapshot and the zone repository.
+A new socket gets one full snapshot. Later pushes are per-asset deltas,
+coalesced for about 50 ms, and serialized once for every subscriber.
+Missions, command phase, and zones ride along only when that state changes.
 """
 
 from __future__ import annotations
@@ -29,8 +29,11 @@ _redis_backoff = 0.5
 _listener_started = False
 _overlay_loaded = False
 _overlay: dict[str, dict[str, dict]] = {"platform": {}, "track": {}, "alert": {}}
-_frame_task: asyncio.Task | None = None
-_frame_again = False
+_coalesce_task: asyncio.Task | None = None
+_dirty_assets: set[str] = set()
+_dirty_tracks: set[str] = set()
+_dirty_picture = False
+_COALESCE_S = 0.05
 _lock = threading.Lock()
 _zone_fail_until = 0.0
 
@@ -53,7 +56,7 @@ class CopHub:
         return len(self._queues)
 
     def subscribe(self) -> asyncio.Queue:
-        queue: asyncio.Queue = asyncio.Queue(maxsize=8)
+        queue: asyncio.Queue = asyncio.Queue(maxsize=32)
         self._queues.append(queue)
         return queue
 
@@ -448,37 +451,106 @@ async def cop_frame(snapshot: dict) -> dict:
     return present_snapshot(snapshot, overlay, zones)
 
 
-async def emit_frame() -> None:
+def _asset_cards(snapshot: dict, overlay: dict, asset_ids: set[str]) -> list[dict]:
+    reduced = {
+        "timestamp": snapshot.get("timestamp"),
+        "assets": [
+            asset for asset in (snapshot.get("assets") or [])
+            if str(asset.get("id") or "") in asset_ids
+        ],
+        "tracks": [],
+        "alerts": [],
+        "missions": [],
+        "recent_commands": [],
+    }
+    return present_snapshot(reduced, overlay, None)["assets"]
+
+
+def _track_cards(snapshot: dict, track_ids: set[str]) -> list[dict]:
+    return [
+        dict(track)
+        for track in (snapshot.get("tracks") or [])
+        if str(track.get("id") or "") in track_ids
+    ]
+
+
+def serialize_frame(frame: dict) -> str:
+    """One JSON text for every subscriber. Sockets send this string as-is."""
+    return json.dumps(frame, default=str, separators=(",", ":"))
+
+
+async def emit_delta(asset_ids: set[str], track_ids: set[str], picture: bool) -> None:
+    """One coalesced push. Asset polls do not rebuild zones or the whole fleet."""
     provider = _provider
-    if provider is None:
+    if provider is None or hub.subscribers == 0:
         return
     try:
-        frame = await cop_frame(await provider())
+        snapshot = await provider()
     except Exception:
         return
-    hub.publish(frame)
-
-
-def _schedule_frame() -> None:
-    global _frame_task, _frame_again
-    if _frame_task is not None and not _frame_task.done():
-        _frame_again = True
+    overlay = read_redis_overlay() if _overlay_loaded else {}
+    frame: dict = {"type": "delta", "timestamp": snapshot.get("timestamp")}
+    try:
+        if picture:
+            zones = await asyncio.to_thread(zone_rings)
+            body = present_snapshot(snapshot, overlay, zones)
+            frame["assets"] = body["assets"]
+            frame["tracks"] = body["tracks"]
+            frame["alerts"] = body["alerts"]
+            frame["missions"] = body["missions"]
+            frame["recent_commands"] = body["recent_commands"]
+            frame["zones"] = body["zones"]
+        else:
+            if asset_ids:
+                frame["assets"] = _asset_cards(snapshot, overlay, asset_ids)
+            if track_ids:
+                frame["tracks"] = _track_cards(snapshot, track_ids)
+    except Exception:
         return
-    _frame_again = False
-    _frame_task = asyncio.create_task(_pump_frames())
+    if set(frame) <= {"type", "timestamp"}:
+        return
+    hub.publish(serialize_frame(frame))
 
 
-async def _pump_frames() -> None:
-    global _frame_again
+def _mark_dirty(asset_id: str | None, track_id: str | None) -> None:
+    global _dirty_picture
+    if hub.subscribers == 0:
+        return
+    if asset_id:
+        _dirty_assets.add(str(asset_id))
+    elif track_id:
+        _dirty_tracks.add(str(track_id))
+    else:
+        _dirty_picture = True
+    _ensure_coalesce()
+
+
+def _ensure_coalesce() -> None:
+    global _coalesce_task
+    if _coalesce_task is not None and not _coalesce_task.done():
+        return
+    _coalesce_task = asyncio.create_task(_coalesced_emit())
+
+
+async def _coalesced_emit() -> None:
+    global _dirty_picture
     while True:
-        _frame_again = False
-        await emit_frame()
-        if not _frame_again:
+        await asyncio.sleep(_COALESCE_S)
+        asset_ids = set(_dirty_assets)
+        track_ids = set(_dirty_tracks)
+        picture = _dirty_picture
+        _dirty_assets.clear()
+        _dirty_tracks.clear()
+        _dirty_picture = False
+        if not asset_ids and not track_ids and not picture:
+            return
+        await emit_delta(asset_ids, track_ids, picture)
+        if not _dirty_assets and not _dirty_tracks and not _dirty_picture:
             return
 
 
-def notify_live() -> None:
-    """Schedule one frame. A second change coalesces into the next push."""
+def notify_live(asset_id: str | None = None, *, track_id: str | None = None) -> None:
+    """Schedule a delta. Changes inside one 50 ms window share a frame."""
     if hub.subscribers == 0:
         return
     try:
@@ -487,9 +559,24 @@ def notify_live() -> None:
         loop = hub.loop
         if loop is None or not loop.is_running():
             return
-        loop.call_soon_threadsafe(_schedule_frame)
+        loop.call_soon_threadsafe(_mark_dirty, asset_id, track_id)
         return
-    _schedule_frame()
+    _mark_dirty(asset_id, track_id)
+
+
+def _notify_overlay(channel: str, payload: dict) -> None:
+    kind = _CHANNEL_KIND.get(str(channel))
+    if kind == "platform":
+        asset_id = str(payload.get("asset_id") or payload.get("platform_id") or payload.get("id") or "")
+        if asset_id:
+            notify_live(asset_id)
+            return
+    if kind == "track":
+        track_id = str(payload.get("id") or payload.get("track_id") or "")
+        if track_id:
+            notify_live(track_id=track_id)
+            return
+    notify_live()
 
 
 def start_redis_listener() -> None:
@@ -544,6 +631,8 @@ def _listen() -> None:
                         payload = None
                     if isinstance(payload, dict):
                         note_overlay(str(channel), payload)
+                        _notify_overlay(str(channel), payload)
+                        continue
                 notify_live()
         except Exception:
             _mark_redis_down()

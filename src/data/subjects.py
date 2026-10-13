@@ -1,8 +1,11 @@
 """NATS subjects and one JetStream stream per family.
 
-Retention matches the architecture note: file storage, 24 hours, 1 GB,
-discard old. Retention policy is limits so ingest and fusion can both
-read telemetry. A work-queue stream would delete a message on the first ack.
+Retention is file storage, 24 hours, discard old. Command, ack, event,
+alert, and DLQ streams stay at 1 GiB. Telemetry is sized for four assets
+at 10 Hz for that same 24 hours, so discard-old does not drop a full-rate
+day before max age. There is no max_msgs cap. Retention policy is limits
+so ingest and fusion can both read telemetry. A work-queue stream would
+delete a message on the first ack.
 """
 
 from __future__ import annotations
@@ -11,6 +14,12 @@ from dataclasses import dataclass
 
 MAX_AGE_SECONDS = 24 * 60 * 60
 MAX_BYTES = 1024 ** 3
+# Four vehicles, the MAVLink stream request, one day, 2 KiB per sample.
+# A kernel JSON sample is under 1 KiB. The extra KiB is headroom.
+TELEMETRY_ASSETS = 4
+TELEMETRY_HZ = 10
+TELEMETRY_MSG_BYTES = 2048
+TELEMETRY_MAX_BYTES = TELEMETRY_ASSETS * TELEMETRY_HZ * MAX_AGE_SECONDS * TELEMETRY_MSG_BYTES
 
 TELEMETRY_PREFIX = "cnc.telemetry."
 COMMAND_PREFIX = "cnc.command."
@@ -40,7 +49,7 @@ COMMAND_DUPLICATE_WINDOW = 120.0
 
 
 STREAMS: tuple[StreamSpec, ...] = (
-    StreamSpec("CNC_TELEMETRY", (TELEMETRY_FILTER,)),
+    StreamSpec("CNC_TELEMETRY", (TELEMETRY_FILTER,), max_bytes=TELEMETRY_MAX_BYTES),
     StreamSpec("CNC_COMMAND", (COMMAND_FILTER,), duplicate_window=COMMAND_DUPLICATE_WINDOW),
     StreamSpec("CNC_ACK", (ACK_FILTER,)),
     StreamSpec("CNC_EVENT", (EVENT_SUBJECT,)),
