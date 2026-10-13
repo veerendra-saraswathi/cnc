@@ -156,6 +156,8 @@ class SimAssetAdapter:
             sample.status.value if hasattr(sample.status, "value") else str(sample.status),
             AssetStatus.IDLE,
         )
+        seen = utcnow()
+        poll_ms = seen.timestamp() * 1000.0
         self.asset.lat = sample.position.lat
         self.asset.lon = sample.position.lon
         self.asset.alt = sample.position.alt
@@ -163,7 +165,8 @@ class SimAssetAdapter:
         self.asset.speed = sample.speed
         self.asset.battery = sample.battery_percent
         self.asset.status = status
-        self.asset.last_seen = utcnow()
+        self.asset.last_seen = seen
+        # The in-process sim has no separate publish clock. adapter_ms is the poll.
         return Telemetry(
             asset_id=self.asset.id,
             lat=sample.position.lat,
@@ -173,6 +176,15 @@ class SimAssetAdapter:
             speed=sample.speed,
             battery=sample.battery_percent,
             status=status,
+            timestamp=seen,
+            extras={
+                "timing": {
+                    "source_ms": None,
+                    "adapter_ms": poll_ms,
+                    "poll_ms": poll_ms,
+                    "message_gap_ms": None,
+                },
+            },
         )
 
     async def get_telemetry(self) -> Telemetry | None:

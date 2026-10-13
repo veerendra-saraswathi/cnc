@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 from simulations.simple_assets import create_demo_fleet
-from src.data.bus import current_mode, get_bus, reset_bus
+from src.data.bus import current_mode, fetch_timed_out, get_bus, reset_bus
 from src.data.subjects import (
     ALERT_SUBJECT,
     DLQ_SUBJECT,
@@ -27,6 +27,15 @@ from src.operator_app.app import Command, CommandType, Platform
 from src.operator_app.command_bus import record_ack_timeout
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_empty_pull_timeout_is_not_a_fatal_error():
+    class TimeoutError(Exception):
+        """Stand-in for nats.errors.TimeoutError, which is not the builtin."""
+
+    assert fetch_timed_out(TimeoutError("nats: timeout"))
+    assert fetch_timed_out(__import__("builtins").TimeoutError())
+    assert not fetch_timed_out(RuntimeError("broker down"))
 
 
 def test_subjects_and_stream_retention():

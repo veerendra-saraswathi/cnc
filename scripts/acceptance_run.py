@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """RCI acceptance run (EOI 10.1–10.4) against the live operator app.
 
-One process serves the dashboard on 127.0.0.1:8765 with CNC_BUS=nats and the
-default DuckDB store. A single WebSocket client plus HTTP commands exercise
-two sim UAVs and two sim UGVs. Faults stop only the cnc-nats-1 and cnc-redis
+One process serves the dashboard with CNC_BUS=nats and the default DuckDB
+store. The bind is 127.0.0.1 unless CNC_FLEET or CNC_HTTP_HOST is set. The
+fleet container binds 0.0.0.0 so compose can publish 127.0.0.1:8765 on the
+host. This client still calls 127.0.0.1. A single WebSocket client plus HTTP
+commands exercise the fleet. Faults stop only the cnc-nats-1 and cnc-redis
 containers, stop one in-process adapter, then restart the app. The script
 records measured behavior. It does not grade a fault as passed when the
 platform did something else.
@@ -52,7 +54,7 @@ _stopped: set[str] = set()
 
 def isolate_stores() -> None:
     """Keep this run off the demo server's DuckDB and SQLite files."""
-    root = Path("/tmp/cnc-m6")
+    root = Path("/tmp/cnc-m7" if os.environ.get("CNC_FLEET") else "/tmp/cnc-m6")
     root.mkdir(parents=True, exist_ok=True)
     os.environ["CNC_DUCKDB_PATH"] = str(root / "cnc.duckdb")
     os.environ["CNC_SNAPSHOT_PATH"] = str(root / "cnc.db")
@@ -109,6 +111,21 @@ def percentile(samples: list[float], pct: float) -> float | None:
     return ordered[low] * (1.0 - weight) + ordered[high] * weight
 
 
+def _stage_num(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _stage_span(start: float | None, end: float | None) -> float | None:
+    if start is None or end is None:
+        return None
+    return end - start
+
+
 def stats(samples: list[float]) -> dict:
     return {
         "n": len(samples),
@@ -152,6 +169,18 @@ def container_info(name: str) -> dict:
     return {"name": name, "present": True, "status": status, "image": image}
 
 
+def _wait_until_stopped(name: str, seconds: float = 20.0) -> dict:
+    """Poll until Docker reports the container is not running."""
+    deadline = time.monotonic() + seconds
+    last = container_info(name)
+    while time.monotonic() < deadline:
+        if last.get("status") != "running":
+            return last
+        time.sleep(0.5)
+        last = container_info(name)
+    return last
+
+
 def docker_stop(name: str) -> dict:
     info = container_info(name)
     if not info.get("present"):
@@ -159,13 +188,33 @@ def docker_stop(name: str) -> dict:
     if info.get("status") != "running":
         return {"ok": False, "action": "stop", "detail": "not running", **info}
     log(f"docker stop {name}")
-    proc = run_cmd(["docker", "stop", name], timeout=45)
-    if proc.returncode == 0:
+    stderr = ""
+    try:
+        # -t 8 sends SIGKILL if the process ignores SIGTERM. Docker Desktop's
+        # API sometimes never returns from `docker stop` even after the task
+        # has exited, which used to abort the fault phase at 45 s.
+        proc = run_cmd(["docker", "stop", "-t", "8", name], timeout=20)
+        stderr = scrub(proc.stderr.strip())
+        ok = proc.returncode == 0
+    except subprocess.TimeoutExpired:
+        log(f"docker stop {name} did not return; killing")
+        try:
+            proc = run_cmd(["docker", "kill", name], timeout=15)
+            stderr = scrub(proc.stderr.strip())
+            ok = proc.returncode == 0
+        except subprocess.TimeoutExpired:
+            ok = False
+            stderr = "docker stop and docker kill timed out"
+    info = _wait_until_stopped(name)
+    if info.get("status") != "running":
+        ok = True
         _stopped.add(name)
+    else:
+        ok = False
     return {
-        "ok": proc.returncode == 0,
+        "ok": ok,
         "action": "stop",
-        "stderr": scrub(proc.stderr.strip()),
+        "stderr": stderr,
         **info,
     }
 
@@ -177,13 +226,29 @@ def docker_start(name: str) -> dict:
     if ALLOWED_CONTAINERS[name] not in info.get("image", ""):
         raise RuntimeError(f"refusing to start {name}")
     log(f"docker start {name}")
-    proc = run_cmd(["docker", "start", name], timeout=45)
-    if proc.returncode == 0:
+    # A stop that is still tearing the task down returns "already exists".
+    deadline = time.monotonic() + 30
+    proc = None
+    while time.monotonic() < deadline:
+        try:
+            proc = run_cmd(["docker", "start", name], timeout=20)
+        except subprocess.TimeoutExpired:
+            proc = None
+            time.sleep(1.0)
+            continue
+        if proc.returncode == 0:
+            break
+        text = proc.stderr or ""
+        if "already exists" not in text and "is already running" not in text:
+            break
+        time.sleep(1.0)
+    if proc is not None and proc.returncode == 0:
         _stopped.discard(name)
+    stderr = "" if proc is None else scrub(proc.stderr.strip())
     return {
-        "ok": proc.returncode == 0,
+        "ok": proc is not None and proc.returncode == 0,
         "action": "start",
-        "stderr": scrub(proc.stderr.strip()),
+        "stderr": stderr,
         **container_info(name),
     }
 
@@ -203,18 +268,33 @@ def restore_containers() -> list[dict]:
     return restored
 
 
-def port_open(port: int) -> bool:
+def probe_host() -> str:
+    """NATS and Redis are on this host. Inside cnc-fleet that is the gateway, not loopback."""
+    return os.environ.get("CNC_PROBE_HOST", "127.0.0.1")
+
+
+def dashboard_host() -> str:
+    """0.0.0.0 inside the fleet container. The local sim server stays on 127.0.0.1."""
+    chosen = os.environ.get("CNC_HTTP_HOST", "").strip()
+    if chosen:
+        return chosen
+    if os.environ.get("CNC_FLEET"):
+        return "0.0.0.0"
+    return "127.0.0.1"
+
+
+def port_open(port: int, host: str = "127.0.0.1") -> bool:
     try:
-        with socket.create_connection(("127.0.0.1", port), 0.4):
+        with socket.create_connection((host, port), 0.4):
             return True
     except OSError:
         return False
 
 
-def wait_port(port: int, timeout: float) -> bool:
+def wait_port(port: int, timeout: float, host: str = "127.0.0.1") -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if port_open(port):
+        if port_open(port, host):
             return True
         time.sleep(0.3)
     return False
@@ -288,7 +368,11 @@ def environment(args) -> dict:
                 containers[name] = {"error": str(exc)}
     return {
         "measured_on": "this laptop",
-        "radio_path": "in-process sim, not field radios or SITL",
+        "radio_path": (
+            f"fleet file {os.environ['CNC_FLEET']}"
+            if os.environ.get("CNC_FLEET")
+            else "in-process sim, not field radios or SITL"
+        ),
         "platform": platform.platform(),
         "python": sys.version.split()[0],
         "machine": platform.machine(),
@@ -300,6 +384,7 @@ def environment(args) -> dict:
         "duckdb_path": os.environ.get("CNC_DUCKDB_PATH", "data/cnc.duckdb"),
         "snapshot_path": os.environ.get("CNC_SNAPSHOT_PATH", "data/cnc.db"),
         "port": args.port,
+        "http_bind": dashboard_host(),
         "scale_cruise_s": args.plan.cruise_s,
         "nats_down_s": args.plan.nats_down_s,
         "reportable": args.plan.reportable,
@@ -347,6 +432,7 @@ class CopClient:
         self.telem_ms: list[float] = []
         self.negative = 0
         self.measure_telem = False
+        self._stages: dict[str, list[float]] = {}
         self._seen: dict[str, datetime] = {}
         self.watch_id: str | None = None
         self.alert_event = asyncio.Event()
@@ -412,6 +498,46 @@ class CopClient:
                 self.negative += 1
                 continue
             self.telem_ms.append(delta_ms)
+            kind = str(asset.get("asset_type") or "other").lower()
+            self._add_stage("all", "poll_to_recv", delta_ms)
+            if kind in {"uav", "ugv"}:
+                self._add_stage(kind, "poll_to_recv", delta_ms)
+            stages = asset.get("stages") if isinstance(asset.get("stages"), dict) else {}
+            recv_ms = recv.timestamp() * 1000.0
+            source = _stage_num(stages.get("source_ms"))
+            adapter = _stage_num(stages.get("adapter_ms"))
+            poll = _stage_num(stages.get("poll_ms"))
+            frame = _stage_num(stages.get("frame_ms"))
+            gap = _stage_num(stages.get("message_gap_ms"))
+            self._add_stage_both(kind, "source_to_adapter", _stage_span(source, adapter))
+            self._add_stage_both(kind, "adapter_to_poll", _stage_span(adapter, poll))
+            self._add_stage_both(kind, "poll_to_frame", _stage_span(poll, frame))
+            self._add_stage_both(kind, "frame_to_recv", _stage_span(frame, recv_ms))
+            self._add_stage_both(kind, "message_gap", gap)
+
+    def _add_stage(self, kind: str, name: str, value: float | None) -> None:
+        if value is None:
+            return
+        self._stages.setdefault(f"{kind}:{name}", []).append(value)
+
+    def _add_stage_both(self, kind: str, name: str, value: float | None) -> None:
+        self._add_stage("all", name, value)
+        if kind in {"uav", "ugv"}:
+            self._add_stage(kind, name, value)
+
+    def stage_report(self) -> dict:
+        names = (
+            "source_to_adapter",
+            "adapter_to_poll",
+            "poll_to_frame",
+            "frame_to_recv",
+            "poll_to_recv",
+            "message_gap",
+        )
+        report = {}
+        for kind in ("all", "uav", "ugv"):
+            report[kind] = {name: stats(self._stages.get(f"{kind}:{name}") or []) for name in names}
+        return report
 
     def _alert(self, frame: dict, recv: datetime) -> None:
         wanted = self.watch_id
@@ -451,15 +577,17 @@ class CopClient:
 class AppServer:
     def __init__(self, port: int) -> None:
         self.port = port
+        self.host = dashboard_host()
         self.server = None
         self.thread: threading.Thread | None = None
 
     def start(self) -> None:
         import uvicorn
 
+        self.host = dashboard_host()
         config = uvicorn.Config(
             "src.operator_app.app:app",
-            host="127.0.0.1",
+            host=self.host,
             port=self.port,
             log_level="warning",
             access_log=False,
@@ -606,7 +734,9 @@ def compact_asset(asset: dict) -> dict:
     }
 
 
-async def wait_health(client, timeout: float = 40) -> dict:
+async def wait_health(client, timeout: float | None = None) -> dict:
+    if timeout is None:
+        timeout = 360.0 if os.environ.get("CNC_FLEET") else 40.0
     deadline = time.monotonic() + timeout
     last = "no response"
     while time.monotonic() < deadline:
@@ -621,7 +751,9 @@ async def wait_health(client, timeout: float = 40) -> dict:
     raise RuntimeError(f"health did not come up: {last}")
 
 
-async def post_json(client, path: str, body: dict | None = None, timeout: float = 20):
+async def post_json(client, path: str, body: dict | None = None, timeout: float | None = None):
+    if timeout is None:
+        timeout = 45.0 if os.environ.get("CNC_FLEET") else 20.0
     started = time.perf_counter()
     try:
         response = await client.post(path, json=body, timeout=timeout)
@@ -866,7 +998,7 @@ async def fault_nats(client, plan: Plan, goto_samples: list) -> dict:
         await asyncio.sleep(remaining)
     down_s = time.monotonic() - down_at
     start = docker_start("cnc-nats-1")
-    port_up = wait_port(4222, 20) if start.get("ok") else False
+    port_up = wait_port(4222, 20, probe_host()) if start.get("ok") else False
     log("waiting for queued command after nats start")
     deadline = time.monotonic() + plan.nats_recover_s
     last = queued.get("evidence")
@@ -1005,7 +1137,7 @@ async def fault_redis(client, cop: CopClient, plan: Plan) -> dict:
             (float(uav["lat"]), float(uav["lon"])),
         )
     start = docker_start("cnc-redis")
-    redis_up = wait_port(6379, 15) if start.get("ok") else False
+    redis_up = wait_port(6379, 15, probe_host()) if start.get("ok") else False
     flags_after: dict = {}
     resume_deadline = time.monotonic() + 8
     while time.monotonic() < resume_deadline:
@@ -1296,6 +1428,8 @@ async def scenario(args) -> int:
     cop: CopClient | None = None
     client = None
     restart_done = False
+    frozen_client = None
+    frozen_server = None
     try:
         if port_open(args.port):
             raise RuntimeError(f"127.0.0.1:{args.port} is already in use")
@@ -1317,6 +1451,8 @@ async def scenario(args) -> int:
             "status": page.status_code,
             "references_dashboard_js": "dashboard.js" in page.text,
             "bytes": len(page.content),
+            "bind_host": server.host,
+            "client_url": f"http://127.0.0.1:{args.port}/",
         }
         cop = CopClient(f"ws://127.0.0.1:{args.port}/ws/cop")
         await cop.start()
@@ -1538,6 +1674,13 @@ async def scenario(args) -> int:
         result["telemetry_samples_ms"] = cop.telem_ms
         result["telemetry_negative_clock"] = cop.negative
         result["frames"] = cop.frames
+        frozen_client = cop.stage_report()
+        try:
+            from src.operator_app.telem_timing import summary as timing_summary
+
+            frozen_server = timing_summary()
+        except Exception as exc:
+            frozen_server = {"error": str(exc)}
         result["faults"].append(await fault_nats(client, args.plan, result["goto_samples_ms"]))
         result["faults"].append(await fault_adapter(client, args.plan))
         result["faults"].append(await fault_redis(client, cop, args.plan))
@@ -1601,6 +1744,27 @@ async def scenario(args) -> int:
             "zone_insert_to_dashboard_frame": stats(result.get("alert_insert_samples_ms") or []),
             "telemetry_negative_clock": result.get("telemetry_negative_clock", 0),
         }
+        if frozen_client is None and cop is not None:
+            try:
+                frozen_client = cop.stage_report()
+            except Exception as exc:
+                frozen_client = {"error": str(exc)}
+        if frozen_server is None:
+            try:
+                from src.operator_app.telem_timing import summary as timing_summary
+
+                frozen_server = timing_summary()
+            except Exception as exc:
+                frozen_server = {"error": str(exc)}
+        result["latency_stages"] = {
+            "sample_target": 3000,
+            "telemetry_n": len(result.get("telemetry_samples_ms") or []),
+            "client": frozen_client,
+            "server": frozen_server,
+            "mavlink_stream_request_hz": 10,
+            "uav_source_time": "unavailable; GLOBAL_POSITION_INT has time_boot_ms, not unix time",
+            "ugv_source_time": "ROS header stamp when it is within 30s of wall clock, otherwise omitted",
+        }
         # Samples can be long. Keep them in the JSON; the markdown report quotes the stats.
         RESULT_PATH.parent.mkdir(parents=True, exist_ok=True)
         RESULT_PATH.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
@@ -1619,15 +1783,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--quick", action="store_true", help="short shake-out, not the acceptance numbers")
     parser.add_argument("--expect", default="")
     parser.add_argument("--result", default="")
+    parser.add_argument(
+        "--report",
+        default="",
+        help="JSON path for the run phase. Default is docs/acceptance_m5.json, or docs/acceptance_m7.json when CNC_FLEET is set.",
+    )
     args = parser.parse_args(argv)
     args.plan = build_plan(args)
     return args
 
 
 def main(argv: list[str] | None = None) -> int:
+    global RESULT_PATH
     os.chdir(ROOT)
     isolate_stores()
     args = parse_args(argv if argv is not None else sys.argv[1:])
+    if args.report:
+        RESULT_PATH = Path(args.report)
+    elif os.environ.get("CNC_FLEET"):
+        RESULT_PATH = ROOT / "docs" / "acceptance_m7.json"
     if args.phase == "recover":
         if not args.expect or not args.result:
             print("recover requires --expect and --result", flush=True)

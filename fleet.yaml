@@ -1,0 +1,28 @@
+# Default fleet for pytest and the operator app.
+# adapter: sim | mavlink | ros2. Mix them in one file.
+# CNC_FLEET points at another file, for example fleet.sitl.yaml.
+assets:
+  - id: uav-01
+    name: Eagle-1
+    type: uav
+    adapter: sim
+    endpoint: ""
+    home: {lat: 17.3850, lon: 78.4867, alt: 80}
+  - id: uav-02
+    name: Eagle-2
+    type: uav
+    adapter: sim
+    endpoint: ""
+    home: {lat: 17.3900, lon: 78.4900, alt: 90}
+  - id: ugv-01
+    name: Wolf-1
+    type: ugv
+    adapter: sim
+    endpoint: ""
+    home: {lat: 17.3820, lon: 78.4840, alt: 0}
+  - id: ugv-02
+    name: Wolf-2
+    type: ugv
+    adapter: sim
+    endpoint: ""
+    home: {lat: 17.3880, lon: 78.4920, alt: 0}

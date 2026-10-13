@@ -138,3 +138,99 @@ After this acceptance run, from the repository root on the default store paths:
 - The operator picture on this run is the entity store plus the SQLite snapshot, with Redis as an overlay. `STORAGE_BACKEND` was duckdb. `cop_frame` does not query Postgres. `PostgresSnapshot.connect` is implemented for a process that sets `STORAGE_BACKEND=postgres`; this run did not.
 - `docs/ARCHITECTURE_DATA.md` still describes `CNC_AUDIT_STRICT=0` as fail-open for a failed durable write. Command dispatch on this commit refuses to send when the durable command event is missing, and the flag was not set to `1`.
 - The dashboard was checked through the acceptance HTTP and WebSocket client on port 8765. It was not opened in a browser, and the 860 px layout was not visually checked.
+
+## M7 — ArduPilot SITL and Gazebo, 13 October 2026
+
+This section is a separate measurement. The sections above record the in-process sim run and are unchanged.
+
+**Record:** `docs/acceptance_m7.json`  
+**When:** `2026-10-13T13:20:39Z` to `2026-10-13T14:13:43Z` (3183.7 s). `--quick` was not used. Cruise was 660 s. The wall clock includes a 1809 s NATS stop, below.  
+**Tree the operator imported:** commit `ca0ad62`, dirty, 29 paths.  
+**Fleet file:** `/work/fleet.sitl.yaml` inside `cnc-fleet`. The default `fleet.yaml` is still the in-process sim, and that is what pytest collects unless `CNC_SITL=1` or `CNC_ROS2=1`.
+
+### Result
+
+Criteria 10.1, 10.2, 10.3, and 10.4 passed. All four faults matched: NATS outage (`down_s` 1809.4, queued GOTO published once and acked), ugv-02 adapter stop (asset and friendly track `lost` after 32 s), Redis outage (picture kept serving, overlay ping recovered), and process restart (four assets and the mission reloaded). `cnc-nats-1` and `cnc-redis` were running again at the end.
+
+`docker stop cnc-nats-1` was logged at `13:32:25Z` and `docker start` at `14:02:37Z`. The stop command returned success with the container exited. The harness passes that command a 20 s timeout. This call outlasted that timeout, which is why the wall clock is about 53 minutes. The fault still matched after the broker came back.
+
+Opening movement over the 12 s observe window:
+
+| Vehicle | Metres |
+| --- | --- |
+| uav-01 | 237.0 |
+| uav-02 | 236.8 |
+| ugv-01 | 51.7 |
+| ugv-02 | 40.1 |
+
+An earlier record the same day measured the same poll-to-receive interval at 1482 ms p95 on 364 samples. This run is the record that replaces it.
+
+### Latency by stage
+
+The 1482 ms figure is poll stamp to WebSocket receive (`poll_to_recv`). This run has 6610 of those samples. The script's stated target is 500 ms. p50 is 233.7 ms, p95 is 537.3 ms, p99 is 757.9 ms, and the max is 2893 ms. Eight samples are over 2 s. None are over 5 s. The target is still missed, by 37 ms at p95. GOTO issue-to-ack p95 is 2.8 s (18 samples, p50 2.1 s). Alert raise-to-dashboard p95 is 724 ms (13 samples, p50 277 ms). Zone insert to dashboard p95 is 1102 ms (13 samples). No telemetry sample had a negative clock.
+
+Stages on the picture path, client samples, milliseconds:
+
+| Stage | All p50 | All p95 | UAV p95 | UGV p95 | n |
+| --- | --- | --- | --- | --- | --- |
+| message gap (simulator receive interval) | 13.6 | 55.2 | 64.1 | 22.9 | 6610 |
+| adapter receive to poll | 9.5 | 44.9 | 52.8 | 18.8 | 6610 |
+| poll to frame assembly | 15.6 | 273.1 | 299.3 | 222.5 | 6610 |
+| frame assembly to WebSocket receive | 175.2 | 432.4 | 419.4 | 444.1 | 6610 |
+| poll to WebSocket receive | 233.7 | 537.3 | 539.1 | 533.1 | 6610 |
+
+`source_to_adapter` has n=0 for both types. ArduCopter `GLOBAL_POSITION_INT` carries `time_boot_ms`, so UAV source unix time is unavailable. The Gazebo odometry header is used as UGV source time only when it is within 30 s of wall clock. This run's headers were sim time, so that stage is omitted. The simulator interval we can measure is the message gap: p95 55 ms overall, 64 ms on the copters, 23 ms on the rovers.
+
+The 537 ms p95 is our picture assembly (p95 273 ms) and the WebSocket hop (p95 432 ms). The simulator message gap is the short stage. UAV and UGV poll-to-receive p95 are 539 ms and 533 ms.
+
+JetStream is off that picture path. The durable queue holds 256 samples and drops the oldest. This run dropped 5710. Of about 6680 polls, 714 received a NATS stamp. `poll_to_nats` p50 is 27.0 s and p95 is 31.3 s. `nats_to_ingest` p95 is 499 ms once a message is published. That backlog does not set `last_seen` and does not feed the WebSocket number above.
+
+What changed in our path: the picture loop applies the in-memory zone check and notifies the dashboard, then one worker does the track update, the JetStream publish, and the sqlite save. A zone-repository failure backs off for 5 s. A Redis pose older than the card's `last_seen` is ignored. MAVLink send and receive share one lock, and the reader waits on the socket before taking it. Each copter arms and holds a stable altitude before the command consumer opens (goal 21 m when home altitude is 30 m). The telemetry publish timeout is 2 s, and a timeout delivers locally. An offline asset does not refresh its friendly track, so a queued sample cannot keep the track active after the adapter stops. The MAVLink stream request is 10 Hz. The requested rate is the setting. The measured copter message-gap p95 is 64 ms.
+
+### What ran
+
+| Vehicle | Software | Connection |
+| --- | --- | --- |
+| uav-01, uav-02 | ArduCopter SITL, image `radarku/ardupilot-sitl:latest` | MAVLink UDP `udpin:0.0.0.0:14550` and `:14560` inside `cnc-fleet`. Each SITL container shares that network namespace and sends `udpclient` to `127.0.0.1`. |
+| ugv-01, ugv-02 | ROS 2 Humble and Gazebo Classic, image `cnc-fleet:humble` | Namespaces `/ugv_01` and `/ugv_02`. Odometry becomes Telemetry. GOTO is a `NavigateToPose` goal on the waypoint follower. The ack is goal acceptance. |
+
+Gazebo ran headless: `xvfb-run` plus `gzserver` only, `LIBGL_ALWAYS_SOFTWARE=1`, `GALLIUM_DRIVER=llvmpipe`, no `gzclient`. The rovers are a diff-drive model. Headless was the setup for this 16 GiB laptop. The run finished, and Gazebo was not killed for memory.
+
+The operator process lived inside `cnc-fleet` and talked to NATS and Redis through `host.docker.internal`. Uvicorn binds `0.0.0.0:8765` inside the container. Compose publishes `127.0.0.1:8765:8765`, so the port is reachable on the Mac and is not published on other interfaces. The in-container check was HTTP 200, 3420 bytes, and the page references `dashboard.js`. From the Mac, `http://localhost:8765` returned HTTP 200, `dashboard.js` returned HTTP 200, and a WebSocket client received all four assets with stage stamps. This session has no browser tool, so the map was not clicked.
+
+### CPU and memory
+
+Host: MacBookPro16,1, Intel Core i7-9750H at 2.60 GHz, 12 logical CPUs, 16 GiB (`hw.memsize` 17179869184). Docker server 29.8.2, VM memory 8839323648 bytes (8.232 GiB), 5 CPUs.
+
+Sixteen samples, one a minute, from `2026-10-13T13:20:39Z` through `2026-10-13T14:14:15Z`, covering this acceptance run:
+
+| Process | CPU | Memory |
+| --- | --- | --- |
+| Docker VM (`VirtualMachine.xpc`) | 339% to 558% | RSS 5.06 GiB to 6.76 GiB (`ps` RSS 5306512 KB to 7089360 KB) |
+| `cnc-fleet` (Gazebo, follower, operator) | 66% to 201% | 232 MiB to 460 MiB |
+| `cnc-sitl-uav-01` | 17% to 58% | docker stats RSS 1.1 MiB to 2.8 MiB |
+| `cnc-sitl-uav-02` | 17% to 52% | docker stats RSS 1.4 MiB to 2.8 MiB |
+| `cnc-nats-1` | 0.6% to 4.6% | 10 MiB to 24 MiB |
+| `cnc-redis` | 0.9% to 3.4% | 5.6 MiB to 6.5 MiB |
+
+The SITL RSS figures are the docker-stats values for containers that use `network_mode: service:cnc-fleet`. Those numbers stay near 1–3 MiB. The VM RSS above is the memory that includes both SITL vehicles and Gazebo.
+
+### Host suite
+
+Commit `ca0ad62` reports 92 passed. That collection is 80 test functions, 12 of which also run a second time under the postgres parameter. `git log --diff-filter=D 7868a51..HEAD -- '**/test_*.py'` is empty, and none of those 80 function names are gone from the tree. No test was deleted.
+
+With `cnc-timescale-1` exited, 25 of those 92 skip because `127.0.0.1:5432` refuses the connection. An intermediate count on this branch was 72 passed and 27 skipped. The same 27 still skip. Nine tests added after that count pass, so the suite is now 81 passed and 27 skipped.
+
+From the repository root, `.venv/bin/python -m pytest -q -rs --tb=no` : 81 passed, 27 skipped, in 9.52 s. Exit code 0. That command does not start SITL or Gazebo.
+
+Skipped because Postgres on `127.0.0.1:5432` is down. The duckdb parameter of a shared test still passes.
+
+- `src/data/test_nats_pipeline.py`: `test_streams_use_the_architecture_retention`, `test_sim_telemetry_reaches_postgres_redis_and_fusion`, `test_goto_is_dispatched_acked_and_audited`, `test_missing_ack_raises_an_alert`, `test_invalid_mavlink_telemetry_lands_on_the_dlq`. The file is marked `nats`. The skip text is the Postgres `OperationalError`, because the JetStream check opens that database.
+- `src/data_services/test_repositories.py`, postgres parameter: `test_asset_upsert_replaces_the_row`, `test_telemetry_inserts_each_sample`, `test_commit_issued_rolls_back_command_and_event_together`, `test_recent_command_keeps_status_and_finds_its_event`, `test_command_insert_ignores_a_duplicate_id`, `test_event_insert_ignores_a_duplicate_and_keeps_a_null_asset`, `test_operator_action_round_trip`, `test_mission_upsert_replaces_status`, `test_track_upsert_replaces_label_state`, `test_detection_insert_ignores_a_duplicate_id`, `test_alert_insert_replaces_the_same_id`, `test_zone_round_trip`.
+- `src/data_services/test_repositories.py`, postgres only: `test_naive_timestamp_is_rejected`, `test_events_and_operator_actions_are_append_only`, `test_telemetry_is_the_only_kernel_hypertable`, `test_time_columns_are_timestamptz`, `test_indexes_cover_asset_id_and_time`, `test_positions_and_zone_polygons_are_postgis`, `test_postgres_snapshot_round_trip`.
+- `src/operator_app/test_live_cop.py`: `test_postgis_keep_out_contains_the_interior_point`.
+
+Skipped until the integration flag is set:
+
+- `src/operator_app/adapters/test_sitl.py`: `test_sitl_goto_hold_and_rtl_ack` — set `CNC_SITL=1` when ArduCopter SITL is sending MAVLink UDP.
+- `src/operator_app/adapters/test_ros2_integration.py`: `test_ros2_odom_and_goto_ack` — set `CNC_ROS2=1` when the Gazebo waypoint action is up.

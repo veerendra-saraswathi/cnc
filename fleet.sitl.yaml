@@ -1,0 +1,29 @@
+# Two ArduCopter SITL vehicles and two Gazebo diff-drive UGVs.
+# UAV endpoints are MAVLink UDP listeners inside cnc-fleet.
+# SITL shares that network namespace and sends udpclient to 127.0.0.1.
+# UGV endpoints are ROS 2 namespaces.
+assets:
+  - id: uav-01
+    name: Eagle-1
+    type: uav
+    adapter: mavlink
+    endpoint: udpin:0.0.0.0:14550
+    home: {lat: 17.3850, lon: 78.4867, alt: 30}
+  - id: uav-02
+    name: Eagle-2
+    type: uav
+    adapter: mavlink
+    endpoint: udpin:0.0.0.0:14560
+    home: {lat: 17.3900, lon: 78.4900, alt: 30}
+  - id: ugv-01
+    name: Wolf-1
+    type: ugv
+    adapter: ros2
+    endpoint: ugv_01
+    home: {lat: 17.3820, lon: 78.4840, alt: 0}
+  - id: ugv-02
+    name: Wolf-2
+    type: ugv
+    adapter: ros2
+    endpoint: ugv_02
+    home: {lat: 17.3880, lon: 78.4920, alt: 0}

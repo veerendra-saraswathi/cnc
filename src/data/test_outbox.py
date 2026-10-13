@@ -150,7 +150,7 @@ def _arm_bus(monkeypatch):
     reset_relay()
     reset_processed()
 
-    async def refuse(self, subject, payload, msg_id=None):
+    async def refuse(self, subject, payload, msg_id=None, timeout=None):
         return False
 
     monkeypatch.setattr(MessageBus, "publish_jetstream", refuse)

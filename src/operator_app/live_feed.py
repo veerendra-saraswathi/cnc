@@ -13,6 +13,7 @@ import asyncio
 import json
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from src.data.redis_live import RedisLiveStore
@@ -31,6 +32,7 @@ _overlay: dict[str, dict[str, dict]] = {"platform": {}, "track": {}, "alert": {}
 _frame_task: asyncio.Task | None = None
 _frame_again = False
 _lock = threading.Lock()
+_zone_fail_until = 0.0
 
 _CHANNEL_KIND = {
     "cnc:telemetry": "platform",
@@ -116,6 +118,24 @@ def mission_progress(mission: dict, commands: list[dict]) -> float:
         if any(phase in {"sent", "acked"} for phase in phases):
             done += 1
     return done / len(assigned)
+
+
+def _epoch(value) -> float | None:
+    """Seconds since the epoch. Overlay and card stamps are ISO strings."""
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number > 10_000_000_000:
+            return number / 1000.0
+        return number
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def _pose(payload: dict) -> dict | None:
@@ -285,10 +305,16 @@ def read_redis_overlay() -> dict:
 
 
 def zone_rings() -> list[dict]:
+    """Zone polygons for the map. A failed repository waits 5 s before the next try."""
+    global _zone_fail_until
+    now = time.monotonic()
+    if now < _zone_fail_until:
+        return []
     rings: list[dict] = []
     try:
         zones = get_repositories().zones.list()
     except Exception:
+        _zone_fail_until = now + 5.0
         return rings
     for zone in zones:
         ring: list[list[float]] = []
@@ -317,6 +343,11 @@ def present_snapshot(snapshot: dict, overlay: dict | None = None, zones: list | 
         if not asset_id:
             continue
         card = by_id.get(asset_id)
+        # A poll newer than this Redis sample owns the picture. Ingest lags the loop.
+        overlay_at = _epoch(payload.get("timestamp"))
+        card_at = _epoch((card or {}).get("last_seen"))
+        if card is not None and overlay_at is not None and card_at is not None and overlay_at + 1e-3 < card_at:
+            continue
         if card is None:
             card = {
                 "id": asset_id,
@@ -381,6 +412,21 @@ def present_snapshot(snapshot: dict, overlay: dict | None = None, zones: list | 
         mission = dict(raw)
         mission["progress"] = mission_progress(mission, commands)
         missions.append(mission)
+
+    from src.operator_app.telem_timing import now_ms, stages_for, stamp_frame
+
+    frame_ms = now_ms()
+    for card in assets:
+        asset_id = str(card.get("id") or "")
+        if not asset_id:
+            continue
+        stages = stages_for(asset_id)
+        if not stages:
+            continue
+        if stages.get("frame_ms") is None:
+            stages["frame_ms"] = frame_ms
+            stamp_frame(asset_id, frame_ms)
+        card["stages"] = stages
 
     return {
         "timestamp": snapshot.get("timestamp"),

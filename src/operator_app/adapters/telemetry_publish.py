@@ -26,8 +26,15 @@ async def accept_vendor_telemetry(raw) -> Telemetry | None:
         await bus.publish_dlq(reason=reason, payload=raw if not isinstance(raw, Telemetry) else raw.model_dump(mode="json"), subject="cnc.telemetry")
         return None
     payload = model.model_dump(mode="json")
-    if not await bus.publish_jetstream(subject, payload):
+    # A stuck broker must not hold the telemetry worker. Two seconds still bounds a local JetStream ack.
+    if not await bus.publish_jetstream(subject, payload, timeout=2.0):
         await bus.deliver_local(subject, payload)
+    timing = (model.extras or {}).get("timing") if isinstance(model.extras, dict) else None
+    poll_ms = timing.get("poll_ms") if isinstance(timing, dict) else None
+    if poll_ms is not None:
+        from src.operator_app.telem_timing import note_nats, now_ms
+
+        note_nats(model.asset_id, poll_ms, now_ms())
     return model
 
 

@@ -28,3 +28,5 @@ sqlalchemy>=2.0.36
 psycopg[binary]>=3.2.0
 alembic>=1.14.0
 nats-py>=2.9.0
+pymavlink>=2.4.40
+pyyaml>=6.0

@@ -1,0 +1,65 @@
+# ArduCopter SITL (one UDP port per UAV) and headless Gazebo for the two UGVs.
+# The operator process for this fleet runs inside cnc-fleet, which has rclpy and pymavlink.
+# Start the lab NATS and Redis from docker-compose.yml first.
+#   docker compose -f docker-compose.fleet.yml up -d --build
+#   scripts/run_fleet_acceptance.sh
+
+services:
+  cnc-fleet:
+    build: docker/ros2
+    image: cnc-fleet:humble
+    container_name: cnc-fleet
+    hostname: cnc-fleet
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - .:/work
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    shm_size: "512mb"
+    environment:
+      ROS_DOMAIN_ID: "42"
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    working_dir: /work
+    entrypoint: ["/work/docker/ros2/entrypoint.sh"]
+
+  # Share cnc-fleet's network namespace. ArduCopter SITL has no UDP
+  # listen mode, and Docker Desktop's bridge drops the GCS reply, so each
+  # vehicle is a udpclient to 127.0.0.1 on its own port.
+  sitl-uav-01:
+    image: radarku/ardupilot-sitl:latest
+    container_name: cnc-sitl-uav-01
+    network_mode: "service:cnc-fleet"
+    depends_on:
+      - cnc-fleet
+    stdin_open: true
+    tty: true
+    entrypoint: ["bash", "-c"]
+    command:
+      - >-
+        exec /ardupilot/build/sitl/bin/arducopter
+        -S -w -I0
+        --home 17.3850,78.4867,0,90
+        --model + --speedup 4
+        --defaults /ardupilot/Tools/autotest/default_params/copter.parm
+        --uartA udpclient:127.0.0.1:14550
+
+  sitl-uav-02:
+    image: radarku/ardupilot-sitl:latest
+    container_name: cnc-sitl-uav-02
+    network_mode: "service:cnc-fleet"
+    depends_on:
+      - cnc-fleet
+    stdin_open: true
+    tty: true
+    entrypoint: ["bash", "-c"]
+    command:
+      - >-
+        exec /ardupilot/build/sitl/bin/arducopter
+        -S -w -I1
+        --home 17.3900,78.4900,0,90
+        --model + --speedup 4
+        --defaults /ardupilot/Tools/autotest/default_params/copter.parm
+        --uartA udpclient:127.0.0.1:14560

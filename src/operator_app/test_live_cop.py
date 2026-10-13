@@ -211,7 +211,7 @@ def test_demo_fleet_ids_homes_and_bus_subjects(monkeypatch):
     ]
     subjects: list[str] = []
 
-    async def capture(subject, payload, msg_id=None):
+    async def capture(subject, payload, msg_id=None, timeout=None):
         subjects.append(subject)
         return True
 

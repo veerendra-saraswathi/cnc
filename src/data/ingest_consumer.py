@@ -49,6 +49,12 @@ async def handle_telemetry(subject: str, data: bytes) -> None:
         status=_status(sample.status),
         mode=sample.mode,
     )
+    timing = (sample.extras or {}).get("timing") if isinstance(sample.extras, dict) else None
+    poll_ms = timing.get("poll_ms") if isinstance(timing, dict) else None
+    if poll_ms is not None:
+        from src.operator_app.telem_timing import note_ingest, now_ms
+
+        note_ingest(sample.asset_id, poll_ms, now_ms())
     if live_telemetry_stale(sample.asset_id, sample.seq):
         return
     _snapshot().put("platform", sample.asset_id, sample.model_dump(mode="json"))

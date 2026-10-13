@@ -226,11 +226,19 @@ class MessageBus:
         if self._js is None:
             self._gave_up = False
 
-    async def publish_jetstream(self, subject: str, payload: dict, *, msg_id: str | None = None) -> bool:
+    async def publish_jetstream(
+        self,
+        subject: str,
+        payload: dict,
+        *,
+        msg_id: str | None = None,
+        timeout: float | None = None,
+    ) -> bool:
         """Publish via JetStream. False means the broker did not accept it.
 
         A successful publish is not also delivered to local subscribers.
         msg_id is the JetStream Nats-Msg-Id deduplication header.
+        timeout bounds this publish only. Command publishes leave it unset.
         """
         if self.mode != "nats":
             return False
@@ -240,7 +248,7 @@ class MessageBus:
             return False
         headers = {"Nats-Msg-Id": msg_id} if msg_id else None
         try:
-            await self.js.publish(subject, _dumps(payload), headers=headers)
+            await self.js.publish(subject, _dumps(payload), headers=headers, timeout=timeout)
             return True
         except Exception as exc:
             logger.warning(f"[bus] publish {subject} failed: {exc}")
@@ -365,6 +373,11 @@ def _stream_config(spec: StreamSpec, discard_policy, retention_policy, storage_t
     return config
 
 
+def fetch_timed_out(exc: BaseException) -> bool:
+    """True when a pull fetch found nothing. nats-py uses its own TimeoutError."""
+    return isinstance(exc, TimeoutError) or type(exc).__name__ == "TimeoutError"
+
+
 class PullConsumer:
     """Durable pull consumer. Explicit ack, five deliveries, then term."""
 
@@ -448,7 +461,11 @@ class PullConsumer:
                 messages = await subscription.fetch(1, timeout=FETCH_TIMEOUT)
             except asyncio.CancelledError:
                 raise
-            except TimeoutError:
+            except Exception as exc:
+                # An empty pull raises nats.errors.TimeoutError, which does not
+                # subclass the builtin TimeoutError, so the consumer used to die idle.
+                if not fetch_timed_out(exc):
+                    raise
                 continue
             for message in messages or []:
                 if self._stop:

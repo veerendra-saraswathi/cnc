@@ -65,3 +65,37 @@ def test_offline_then_lost_is_one_warning_per_asset():
         assert len([item for item in store.alerts.values() if item.id.startswith("presence-")]) == 1
 
     asyncio.run(body())
+
+
+def test_offline_asset_does_not_refresh_the_friendly_track():
+    async def body():
+        store = EntityStore(_Memory())
+        asset = Asset(
+            id="ugv-02",
+            name="Wolf-2",
+            asset_type=AssetType.UGV,
+            status=AssetStatus.OFFLINE,
+            lat=17.38,
+            lon=78.49,
+        )
+        store.assets[asset.id] = asset
+        stamp = utcnow() - timedelta(seconds=20)
+        track = Track(
+            id="own-ugv-02",
+            label="Wolf-2",
+            track_type=TrackType.FRIENDLY,
+            state=TrackState.ACTIVE,
+            lat=17.38,
+            lon=78.49,
+            source_asset_ids=["ugv-02"],
+            last_update=stamp,
+        )
+        store.tracks[track.id] = track
+        manager = TrackManager(store)
+        manager._asset_to_track[asset.id] = track.id
+        returned = await manager.update_from_asset(asset)
+        assert returned is track
+        assert track.last_update == stamp
+        assert track.state == TrackState.ACTIVE
+
+    asyncio.run(body())

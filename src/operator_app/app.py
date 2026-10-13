@@ -212,8 +212,15 @@ class TrackManager:
         if len(track.history) > MAX_HISTORY:
             track.history = track.history[-MAX_HISTORY:]
 
-    async def update_from_asset(self, asset: Asset) -> Track:
+    async def update_from_asset(self, asset: Asset) -> Track | None:
         track_id = self._asset_to_track.get(asset.id)
+        # A sample still in the durable queue must not mark a stopped vehicle active.
+        if track_id is not None and asset.status in (
+            AssetStatus.OFFLINE,
+            AssetStatus.LOST,
+            AssetStatus.ERROR,
+        ):
+            return await self.store.get_track(track_id)
         if track_id is None:
             # try to find existing track by label after recovery
             for t in await self.store.list_tracks():
@@ -523,12 +530,13 @@ class Platform:
         self.operator_action_repo = InMemoryOperatorActionRepository()
         self._task = self._lifecycle_task = None
         self._running = False
+        self._commands_open = False
 
     @property
     def operator_actions(self) -> list[OperatorAction]:
         return self.operator_action_repo.records
 
-    async def register(self, mock: MockAsset):
+    async def register(self, mock: MockAsset, *, start: bool = True):
         # If we recovered an asset with the same name, reuse its id for continuity
         for existing in self.store.assets.values():
             if existing.name == mock.asset.name:
@@ -539,6 +547,8 @@ class Platform:
                 break
         await self.store.upsert_asset(mock.asset)
         self.adapters[mock.id] = mock
+        if not start:
+            return
         await mock.start()
         await self.track_manager.update_from_asset(mock.asset)
         await self.store.add_alert(Alert(
@@ -629,20 +639,27 @@ class Platform:
         from src.operator_app.command_bus import start_command_bridge
 
         async def _consumers_up() -> None:
-            if await start_pipeline():
+            if await start_pipeline() and self._commands_open:
                 await start_command_bridge(self.adapters.get)
 
         async def _consumers_again() -> None:
             from src.data.pipeline import restart_pipeline
             from src.operator_app.command_bus import restart_command_bridge
-            if await restart_pipeline():
+            if await restart_pipeline() and self._commands_open:
                 await restart_command_bridge(self.adapters.get)
 
         if current_mode() == "nats":
             await start_relay(_consumers_up, on_reconnect=_consumers_again)
             await _consumers_up()
-        elif await start_pipeline():
-            await start_command_bridge(self.adapters.get)
+        else:
+            await start_pipeline()
+
+    async def open_command_consumer(self) -> None:
+        """Subscribe to commands only after adapters are in self.adapters."""
+        from src.operator_app.command_bus import start_command_bridge
+
+        self._commands_open = True
+        await start_command_bridge(self.adapters.get)
 
     async def stop(self):
         self._running = False
@@ -663,39 +680,90 @@ class Platform:
             await ad.stop()
         await self.db.close()
 
-    async def _telem_loop(self):
-        while self._running:
+    def _record_poll(self, adapter, sample) -> None:
+        from src.operator_app.telem_timing import note_poll
+
+        extras = getattr(sample, "extras", None) or {}
+        timing = extras.get("timing") if isinstance(extras, dict) else None
+        timing = timing if isinstance(timing, dict) else {}
+        poll_ms = timing.get("poll_ms")
+        if poll_ms is None:
+            poll_ms = sample.timestamp.timestamp() * 1000.0
+        kind = getattr(getattr(adapter, "asset", None), "asset_type", None)
+        note_poll(
+            sample.asset_id,
+            kind,
+            timing.get("source_ms"),
+            timing.get("adapter_ms"),
+            poll_ms,
+            timing.get("message_gap_ms"),
+        )
+
+    async def _durable_telem(self, queue: asyncio.Queue) -> None:
+        """Zone, track, JetStream, and sqlite. One worker keeps the snapshot writes ordered."""
+        while True:
+            adapter, sample, publish = await queue.get()
             try:
-                for ad in list(self.adapters.values()):
-                    poll = getattr(ad, "poll_telemetry", None)
-                    if poll is not None:
-                        t = poll()
-                    else:
-                        t = await ad.get_telemetry()
-                    if not t:
-                        continue
-                    # Stamp is already on t. Push before publish and the snapshot write.
-                    asset = await self.store.update_from_telem(t, persist=False)
-                    if asset is not None:
-                        notify_live()
-                        await apply_zone_check(self.store, asset)
-                        await self.track_manager.update_from_asset(asset)
-                    if poll is not None:
-                        await ad.publish_vendor_telemetry(t)
-                    if asset is not None:
-                        await self.store.db.save_asset(asset)
-                    if t.battery < 20:
-                        alert_id = f"battery-{t.asset_id}"
-                        if alert_id not in self.store.alerts:
-                            await self.store.add_alert(Alert(
-                                id=alert_id,
-                                level=AlertLevel.WARNING, title="Low battery",
-                                message=f"{ad.asset.name} at {t.battery:.0f}%",
-                                asset_id=ad.id, source="health",
-                            ))
-                await asyncio.sleep(0.1)
-            except asyncio.CancelledError: break
-            except Exception: await asyncio.sleep(1.0)
+                asset = self.store.assets.get(sample.asset_id)
+                if asset is not None:
+                    await self.track_manager.update_from_asset(asset)
+                if publish:
+                    await adapter.publish_vendor_telemetry(sample)
+                if asset is not None:
+                    await self.store.db.save_asset(asset)
+                if sample.battery < 20:
+                    alert_id = f"battery-{sample.asset_id}"
+                    if alert_id not in self.store.alerts:
+                        await self.store.add_alert(Alert(
+                            id=alert_id,
+                            level=AlertLevel.WARNING, title="Low battery",
+                            message=f"{adapter.asset.name} at {sample.battery:.0f}%",
+                            asset_id=adapter.id, source="health",
+                        ))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            finally:
+                queue.task_done()
+
+    async def _telem_loop(self):
+        from src.operator_app.telem_timing import offer
+
+        # Durable work stays off this loop so a frame is not waiting on sqlite or JetStream.
+        queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+        worker = asyncio.create_task(self._durable_telem(queue))
+        try:
+            while self._running:
+                try:
+                    for ad in list(self.adapters.values()):
+                        poll = getattr(ad, "poll_telemetry", None)
+                        if poll is not None:
+                            sample = poll()
+                        else:
+                            sample = await ad.get_telemetry()
+                        if not sample:
+                            continue
+                        asset = await self.store.update_from_telem(sample, persist=False)
+                        self._record_poll(ad, sample)
+                        if asset is not None:
+                            # DuckDB zone checks are in memory. Alerts must not wait on JetStream.
+                            await apply_zone_check(self.store, asset)
+                            notify_live()
+                        # The frame task reads last_seen before the next asset is polled.
+                        await asyncio.sleep(0)
+                        offer(queue, (ad, sample, poll is not None))
+                    await asyncio.sleep(0.1)
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    await asyncio.sleep(1.0)
+        finally:
+            worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
 
     async def _lifecycle_loop(self):
         while self._running:
@@ -716,20 +784,41 @@ async def _cop_snapshot() -> dict:
 bind_snapshot(_cop_snapshot)
 
 
-async def _register_demo_fleet() -> None:
-    """Two UAVs and two UGVs, each kept on its sim id and home."""
-    from src.operator_app.demo_fleet import demo_adapters
-    for adapter in demo_adapters():
-        wanted = adapter.sim.info.asset_id
-        await platform.register(adapter)
-        if adapter.asset.id == wanted:
-            continue
-        previous = adapter.asset.id
-        platform.adapters.pop(previous, None)
-        platform.store.assets.pop(previous, None)
-        adapter.asset.id = wanted
-        platform.adapters[wanted] = adapter
-        await platform.store.upsert_asset(adapter.asset)
+async def _register_configured_fleet() -> None:
+    """Register every fleet.yaml asset, then connect them together.
+
+    The command consumer is still closed here, so a late vehicle cannot nak
+    a command that arrived while connect() was waiting on a heartbeat.
+    """
+    from src.operator_app.fleet_config import load_fleet_adapters
+
+    adapters = load_fleet_adapters()
+    for adapter in adapters:
+        wanted = adapter.asset.id
+        await platform.register(adapter, start=False)
+        if adapter.asset.id != wanted:
+            previous = adapter.asset.id
+            platform.adapters.pop(previous, None)
+            platform.store.assets.pop(previous, None)
+            adapter.asset.id = wanted
+            platform.adapters[wanted] = adapter
+            await platform.store.upsert_asset(adapter.asset)
+    if adapters:
+        await asyncio.gather(*(adapter.start() for adapter in adapters))
+    for adapter in adapters:
+        await platform.track_manager.update_from_asset(adapter.asset)
+        await platform.store.add_alert(Alert(
+            level=AlertLevel.INFO, title="Asset online",
+            message=f"{adapter.asset.name} connected", asset_id=adapter.asset.id,
+        ))
+
+
+async def boot_operator() -> None:
+    """Start the app, register the fleet, then open the command consumer."""
+    await platform.start()
+    start_redis_listener()
+    await _register_configured_fleet()
+    await platform.open_command_consumer()
 
 def _rehydrate_operator_history(store: EntityStore) -> int:
     """Copy recent commands and events from the durable store into memory."""
@@ -805,9 +894,7 @@ def _record_command_event(cmd: Command) -> Event:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await platform.start()
-    start_redis_listener()
-    await _register_demo_fleet()
+    await boot_operator()
     yield
     await platform.stop()
 
